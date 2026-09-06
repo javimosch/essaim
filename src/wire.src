@@ -1,0 +1,59 @@
+// Big-endian packing/unpacking. Every byte on the BitTorrent wire -- the UDP
+// tracker protocol, the peer handshake, the message framing -- is network order.
+//
+// Values are BUILT as hex strings and turned into bytes with from_hex(), rather
+// than poked into a buffer: bytes values are immutable here, hex concatenation
+// is obvious to read against the spec's field tables, and it sidesteps the
+// signed-overflow question entirely (MFL ints are 64-bit signed, so shifting a
+// 32-bit field's high bit around is a place bugs hide).
+
+func hex_of_byte(b) (s) { d := "0123456789abcdef"
+	v := b
+	if v < 0 { v = 0 }
+	if v > 255 { v = 255 }
+	s = charat(d, v / 16) + charat(d, v - (v / 16) * 16) }
+
+func be16_hex(n) (s) { v := n
+	if v < 0 { v = 0 }
+	s = hex_of_byte(v / 256) + hex_of_byte(v - (v / 256) * 256) }
+
+func be32_hex(n) (s) { v := n
+	if v < 0 { v = 0 }
+	s = ""
+	i := 3
+	for i >= 0 { s = s + hex_of_byte(byte_of(v, i))  i = i - 1 } }
+
+func be64_hex(n) (s) { v := n
+	if v < 0 { v = 0 }
+	s = ""
+	i := 7
+	for i >= 0 { s = s + hex_of_byte(byte_of(v, i))  i = i - 1 } }
+
+// byte_of extracts byte i (0 = least significant) by division, not shifting.
+func byte_of(v, i) (b) { d := 1
+	k := 0
+	for k < i { d = d * 256  k = k + 1 }
+	b = (v / d) - ((v / d) / 256) * 256 }
+
+func rd8(b, off) (v) { v = 0
+	if off < 0 { return v }
+	if off >= len(b) { return v }
+	v = byte_at(b, off) }
+
+func rd16(b, off) (v) { v = rd8(b, off) * 256 + rd8(b, off + 1) }
+
+func rd32(b, off) (v) { v = rd16(b, off) * 65536 + rd16(b, off + 2) }
+
+func rd64(b, off) (v) { v = rd32(b, off) * 4294967296 + rd32(b, off + 4) }
+
+// pct_hex percent-encodes the bytes a hex string denotes. A tracker's
+// info_hash/peer_id query params are RAW 20-byte values, so they cannot go
+// through url_encode (a string builtin that stops at a NUL) -- every byte is
+// escaped unconditionally, which is always valid and never ambiguous.
+func pct_hex(h) (out) { out = ""
+	i := 0
+	for i + 1 < len(h) { out = out + "%" + substr(h, i, i + 2)  i = i + 2 } }
+
+// ipv4_str renders the 4 bytes at off as dotted quad -- the compact peer format
+// (BEP 23) is 6 bytes per peer: 4 of address, 2 of port.
+func ipv4_str(b, off) (s) { s = str(rd8(b, off)) + "." + str(rd8(b, off + 1)) + "." + str(rd8(b, off + 2)) + "." + str(rd8(b, off + 3)) }

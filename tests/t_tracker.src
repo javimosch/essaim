@@ -1,0 +1,77 @@
+var g_fail = 0
+
+func expect(name, got, want) { if got == want { println("ok   " + name)  return }
+	println("FAIL " + name + "\n  got  " + got + "\n  want " + want)
+	g_fail = g_fail + 1 }
+
+// A stand-in UDP tracker that speaks BEP 15 well enough to be a real oracle:
+// it echoes the client's transaction ids (so a mismatch would be caught) and
+// answers with two compact peers.
+//
+// It reports what it SAW over a channel rather than through globals. A
+// goroutine's value-arena is reclaimed in bulk when it returns, so a string it
+// built and stored in a global dangles the moment it exits -- later allocations
+// overwrite it (observed: a 16-char hex string read back as 17 chars with a
+// stray 0xa0). Channel sends copy, so they are the safe way across goroutines.
+func fake_tracker(fd, connid, seen) { req, addr, port := udp_recvfrom(fd)
+	if port == 0 { seen <- "no connect request"  return }
+	txid := to_hex(bytes_sub(req, 12, 16))
+	udp_sendto(fd, addr, port, from_hex(be32_hex(0) + txid + connid))
+	req2, addr2, port2 := udp_recvfrom(fd)
+	if port2 == 0 { seen <- "no announce request"  return }
+	txid2 := to_hex(bytes_sub(req2, 12, 16))
+	peers := "c0a80101" + "1ae1" + "0a000005" + "0050"
+	udp_sendto(fd, addr2, port2, from_hex(be32_hex(1) + txid2 + be32_hex(1800) + be32_hex(3) + be32_hex(9) + peers))
+	seen <- json(AnnReq{len: len(req2), connid: to_hex(bytes_sub(req2, 0, 8)), action: rd32(req2, 8), infohash: to_hex(bytes_sub(req2, 16, 36)), left: rd64(req2, 64), port: rd16(req2, 96)}) }
+
+type AnnReq struct { len int  connid string  action int  infohash string  left int  port int }
+
+func main() { expect("compact-empty", str(len(peers_from_compact(bytes("")))), "0")
+	pc := peers_from_compact(from_hex("c0a801011ae10a0000050050"))
+	expect("compact-n", str(len(pc)), "2")
+	if len(pc) > 1 { expect("compact-ip0", pc[0].ip, "192.168.1.1")
+		expect("compact-port0", str(pc[0].port), "6881")
+		expect("compact-ip1", pc[1].ip, "10.0.0.5")
+		expect("compact-port1", str(pc[1].port), "80") }
+	// a trailing partial record is ignored rather than read out of bounds
+	expect("compact-ragged", str(len(peers_from_compact(from_hex("c0a801011ae1ffff")))), "1")
+	h, p := udp_url_split("udp://tracker.opentrackr.org:1337/announce")
+	expect("udp-host", h, "tracker.opentrackr.org")
+	expect("udp-port", str(p), "1337")
+	bh, _ := udp_url_split("udp://noport")
+	expect("udp-badurl", bh, "")
+	expect("peerid-len", str(len(peer_id_new())), "40")
+	expect("peerid-prefix", substr(peer_id_new(), 0, 16), to_hex(bytes("-ES0001-")))
+	// full BEP 15 round trip against the local stand-in
+	srv := udp_socket(19812)
+	if srv < 0 { println("FAIL cannot bind test tracker")  exit(1) }
+	connid := "1122334455667788"
+	seen := make(chan string)
+	go fake_tracker(srv, connid, seen)
+	ih := "0123456789abcdef0123456789abcdef01234567"
+	a := tracker_announce("udp://127.0.0.1:19812/announce", ih, peer_id_new(), 6881, 4096, 3000)
+	close(srv)
+	expect("ann-ok", str(a.ok), "1")
+	expect("ann-err", a.err, "")
+	expect("ann-interval", str(a.interval), "1800")
+	expect("ann-leechers", str(a.leechers), "3")
+	expect("ann-seeders", str(a.seeders), "9")
+	expect("ann-npeers", str(len(a.peers)), "2")
+	if len(a.peers) > 0 { expect("ann-peer0", a.peers[0].ip + ":" + str(a.peers[0].port), "192.168.1.1:6881") }
+	// and the REQUEST we sent must match the spec's field layout
+	got := parse(<-seen, AnnReq{})
+	expect("req-len", str(got.len), "98")
+	expect("req-connid", got.connid, connid)
+	expect("req-action", str(got.action), "1")
+	expect("req-infohash", got.infohash, ih)
+	expect("req-left", str(got.left), "4096")
+	expect("req-port", str(got.port), "6881")
+	// a tracker that never answers is an error, not a hang
+	t0 := now_ms()
+	dead := tracker_announce("udp://127.0.0.1:19813/announce", ih, peer_id_new(), 6881, 1, 400)
+	expect("dead-ok", str(dead.ok), "0")
+	expect("dead-err", dead.err, "tracker timeout (connect)")
+	if now_ms() - t0 > 3000 { println("FAIL timeout did not bound the wait")  g_fail = g_fail + 1 }
+	expect("bad-scheme", tracker_announce("ftp://x/y", ih, peer_id_new(), 1, 1, 100).err, "unsupported tracker scheme")
+	if g_fail == 0 { println("\nALL PASS") }
+	if g_fail > 0 { println("\n" + str(g_fail) + " FAILED")  exit(1) } }

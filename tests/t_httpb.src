@@ -1,0 +1,33 @@
+var g_fail = 0
+
+func expect(name, got, want) { if got == want { println("ok   " + name)  return }
+	println("FAIL " + name + "\n  got  " + got + "\n  want " + want)
+	g_fail = g_fail + 1 }
+
+func main() { u := url_parse("http://tracker.example.com:6969/announce?x=1")
+	expect("scheme", u.scheme, "http")
+	expect("host", u.host, "tracker.example.com")
+	expect("port", str(u.port), "6969")
+	expect("path", u.path, "/announce?x=1")
+	d := url_parse("https://example.org/a/b")
+	expect("https-port", str(d.port), "443")
+	expect("https-scheme", d.scheme, "https")
+	p := url_parse("http://h.io")
+	expect("default-path", p.path, "/")
+	expect("default-port", str(p.port), "80")
+	bad := url_parse("not a url")
+	expect("reject", str(bad.ok), "0")
+	// status + body split must work on BYTES, so a NUL in the body survives
+	raw := bytes_concat(bytes("HTTP/1.1 200 OK\r\nContent-Type: x\r\n\r\n"), from_hex("00ff0041"))
+	expect("status", str(http_status(raw)), "200")
+	expect("body-binary", to_hex(http_split_body(raw)), "00ff0041")
+	e404 := bytes("HTTP/1.1 404 Not Found\r\n\r\nnope")
+	expect("status404", str(http_status(e404)), "404")
+	expect("hex-int", str(hex_int("1a")), "26")
+	ch := bytes("4\r\nWiki\r\n5\r\npedia\r\n0\r\n\r\n")
+	expect("dechunk", bytes_str(dechunk(ch)), "Wikipedia")
+	chraw := bytes("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+	expect("is-chunked", str(http_is_chunked(chraw)), "1")
+	expect("not-chunked", str(http_is_chunked(raw)), "0")
+	if g_fail == 0 { println("\nALL PASS") }
+	if g_fail > 0 { println("\n" + str(g_fail) + " FAILED")  exit(1) } }

@@ -1,0 +1,37 @@
+var g_fail = 0
+
+func expect(name, got, want) { if got == want { println("ok   " + name)  return }
+	println("FAIL " + name + "\n  got  " + got + "\n  want " + want)
+	g_fail = g_fail + 1 }
+
+func main() { expect("byte", hex_of_byte(255), "ff")
+	expect("byte0", hex_of_byte(0), "00")
+	expect("be16", be16_hex(6881), "1ae1")
+	expect("be16-max", be16_hex(65535), "ffff")
+	expect("be32", be32_hex(1), "00000001")
+	expect("be32-big", be32_hex(4294967295), "ffffffff")
+	// the BEP 15 magic constant, the one value every UDP tracker checks
+	expect("be64-magic", be64_hex(4497486125440), "0000041727101980")
+	expect("be64-zero", be64_hex(0), "0000000000000000")
+	b := from_hex("00ff1ae1000000010000041727101980")
+	expect("rd8", str(rd8(b, 1)), "255")
+	expect("rd16", str(rd16(b, 2)), "6881")
+	expect("rd32", str(rd32(b, 4)), "1")
+	expect("rd64", str(rd64(b, 8)), "4497486125440")
+	// reads past the end are 0, never a crash -- a truncated datagram is normal
+	expect("rd8-oob", str(rd8(b, 999)), "0")
+	// a read that STRADDLES the end zero-fills the missing tail rather than
+	// failing; only a fully out-of-range read is 0. Callers length-check a
+	// datagram before parsing, so this is a safety net, not the contract.
+	expect("rd32-straddle", str(rd32(b, 14)), "427819008")
+	expect("rd32-past-end", str(rd32(b, 64)), "0")
+	// a round trip through the packers must be the identity
+	expect("roundtrip32", str(rd32(from_hex(be32_hex(123456789)), 0)), "123456789")
+	expect("roundtrip64", str(rd64(from_hex(be64_hex(9007199254740993)), 0)), "9007199254740993")
+	expect("pct", pct_hex("0a1bff"), "%0a%1b%ff")
+	expect("pct-empty", pct_hex(""), "")
+	p := from_hex("c0a801011ae1")
+	expect("ipv4", ipv4_str(p, 0), "192.168.1.1")
+	expect("peer-port", str(rd16(p, 4)), "6881")
+	if g_fail == 0 { println("\nALL PASS") }
+	if g_fail > 0 { println("\n" + str(g_fail) + " FAILED")  exit(1) } }

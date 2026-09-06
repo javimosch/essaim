@@ -1,0 +1,101 @@
+// A binary-safe HTTP/1.1 GET.
+//
+// machin's http_get returns the body as a STRING, which stops at the first NUL.
+// That is fatal here: a tracker's announce reply is bencoded binary whose
+// compact peer list is raw 6-byte records, usually containing NULs in the very
+// first address. So the request is spoken over dial()/read_bytes() (or a TLS
+// handle) and the body comes back as bytes, untouched.
+//
+// This is a deliberately small client: one GET, no redirects beyond a single
+// hop, no keep-alive. Trackers and index pages need nothing more.
+
+type Url struct { scheme string  host string  port int  path string  ok int }
+
+func url_parse(u) (r) { r = Url{scheme: "http", port: 80, path: "/", ok: 0}
+	rest := u
+	if has_prefix(rest, "https://") { r.scheme = "https"  r.port = 443  rest = substr(rest, 8, len(rest)) }
+	if has_prefix(rest, "http://") { rest = substr(rest, 7, len(rest)) }
+	if rest == u { if has_prefix(u, "http") == false { return r } }
+	slash := index(rest, "/")
+	hostport := rest
+	if slash >= 0 { hostport = substr(rest, 0, slash)  r.path = substr(rest, slash, len(rest)) }
+	colon := index(hostport, ":")
+	if colon >= 0 { r.host = substr(hostport, 0, colon)
+		r.port = parse_int(substr(hostport, colon + 1, len(hostport))) }
+	if colon < 0 { r.host = hostport }
+	if r.host == "" { return r }
+	if r.port <= 0 { return r }
+	r.ok = 1 }
+
+// http_get_b performs the GET and returns (status, body bytes, err). err is ""
+// on any HTTP response -- a 404 is a RESULT, not an error -- and one of
+// "url"/"connect"/"tls"/"timeout" when no response was obtained at all.
+func http_get_b(u, timeout_ms) (status, body, err) { status = 0  body = bytes("")  err = ""
+	r := url_parse(u)
+	if r.ok == 0 { err = "url"  return status, body, err }
+	fd := dial(r.host, r.port)
+	if fd < 0 { err = "connect"  return status, body, err }
+	socket_timeout(fd, timeout_ms)
+	req := "GET " + r.path + " HTTP/1.1\r\nHost: " + r.host + "\r\nUser-Agent: essaim/0.1\r\nAccept: */*\r\nConnection: close\r\n\r\n"
+	raw := bytes("")
+	if r.scheme == "https" { h := tls_client_fd(fd, r.host)
+		if h == 0 { close(fd)  err = "tls"  return status, body, err }
+		tls_write(h, req)
+		for 1 == 1 { chunk := tls_read_bytes(h)
+			if len(chunk) == 0 { break }
+			raw = bytes_concat(raw, chunk) }
+		tls_close(h) }
+	if r.scheme != "https" { write(fd, req)
+		for 1 == 1 { chunk := read_bytes(fd)
+			if len(chunk) == 0 { break }
+			raw = bytes_concat(raw, chunk) }
+		close(fd) }
+	if len(raw) == 0 { err = "timeout"  return status, body, err }
+	status = http_status(raw)
+	body = http_split_body(raw)
+	if http_is_chunked(raw) == 1 { body = dechunk(body) } }
+
+func http_status(raw) (code) { code = 0
+	sp := bytes_index(raw, bytes(" "), 0)
+	if sp < 0 { return code }
+	code = parse_int(bytes_str(bytes_sub(raw, sp + 1, sp + 4))) }
+
+// The body starts after the blank line. Searching the BYTES (not a string) is
+// what keeps a binary body intact.
+func http_split_body(raw) (body) { body = bytes("")
+	i := bytes_index(raw, bytes("\r\n\r\n"), 0)
+	if i >= 0 { body = bytes_sub(raw, i + 4, len(raw))  return body }
+	i = bytes_index(raw, bytes("\n\n"), 0)
+	if i >= 0 { body = bytes_sub(raw, i + 2, len(raw)) } }
+
+func http_is_chunked(raw) (yes) { yes = 0
+	hdr_end := bytes_index(raw, bytes("\r\n\r\n"), 0)
+	if hdr_end < 0 { hdr_end = len(raw) }
+	h := to_lower(bytes_str(bytes_sub(raw, 0, hdr_end)))
+	if contains(h, "transfer-encoding: chunked") { yes = 1 } }
+
+// Connection: close still gets chunked bodies from some trackers, so the
+// framing has to be undone before the bencode parser sees it.
+func dechunk(b) (out) { out = bytes("")
+	pos := 0
+	for pos < len(b) { nl := bytes_index(b, bytes("\r\n"), pos)
+		if nl < 0 { return out }
+		sizehex := trim(bytes_str(bytes_sub(b, pos, nl)))
+		semi := index(sizehex, ";")
+		if semi >= 0 { sizehex = substr(sizehex, 0, semi) }
+		n := hex_int(sizehex)
+		if n <= 0 { return out }
+		start := nl + 2
+		stop := start + n
+		if stop > len(b) { stop = len(b) }
+		out = bytes_concat(out, bytes_sub(b, start, stop))
+		pos = stop + 2 } }
+
+func hex_int(h) (v) { v = 0
+	i := 0
+	s := to_lower(trim(h))
+	for i < len(s) { c := charat(s, i)
+		d := index("0123456789abcdef", c)
+		if d < 0 { return v }
+		v = v * 16 + d
+		i = i + 1 } }

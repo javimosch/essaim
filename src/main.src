@@ -26,6 +26,10 @@ func main() { a := args()
 	if cmd == "get" { cmd_get(a) }
 	if cmd == "search" { cmd_search(a) }
 	if cmd == "sources" { cmd_sources() }
+	if cmd == "install" { cmd_install(a) }
+	if cmd == "uninstall" { cmd_uninstall(a) }
+	if cmd == "update" { cmd_update(a) }
+	if cmd == "feedback" { cmd_feedback(a) }
 	fail(EXIT_ARGS, "unknown_command", "no such command: " + cmd, []string{"essaim help-json", "essaim guide"}) }
 
 func cmd_sources() { srcs := sources_default()

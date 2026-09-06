@@ -153,3 +153,29 @@ func hex_int(h) (v) { v = 0
 		if d < 0 { return v }
 		v = v * 16 + d
 		i = i + 1 } }
+
+// http_post_b posts a JSON body. Feedback is the only thing essaim sends
+// outward, so this stays as small as the GET path.
+func http_post_b(u, body, timeout_ms) (status, out, err) { status = 0  out = bytes("")  err = ""
+	r := url_parse(u)
+	if r.ok == 0 { err = "url"  return status, out, err }
+	fd := dial(r.host, r.port)
+	if fd < 0 { err = "connect"  return status, out, err }
+	socket_timeout(fd, timeout_ms)
+	req := "POST " + r.path + " HTTP/1.1\r\nHost: " + r.host + "\r\nUser-Agent: essaim/0.1\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)) + "\r\nConnection: close\r\n\r\n" + body
+	raw := bytes("")
+	if r.scheme == "https" { h := tls_client_fd(fd, r.host)
+		if h == 0 { close(fd)  err = "tls"  return status, out, err }
+		tls_write(h, req)
+		for 1 == 1 { c := tls_read_bytes(h)
+			if len(c) == 0 { break }
+			raw = bytes_concat(raw, c) }
+		tls_close(h) }
+	if r.scheme != "https" { write(fd, req)
+		for 1 == 1 { c := read_bytes(fd)
+			if len(c) == 0 { break }
+			raw = bytes_concat(raw, c) }
+		close(fd) }
+	if len(raw) == 0 { err = "timeout"  return status, out, err }
+	status = http_status(raw)
+	out = http_split_body(raw) }

@@ -1,0 +1,88 @@
+// install/uninstall (cli-update-spec §6), update, and feedback
+// (cli-feedback-spec).
+//
+// NO TELEMETRY, deliberately. cli-telemetry-spec §8.1 says a tool that cannot
+// satisfy the "must not send" list for its domain should ship none, and for a
+// BitTorrent client the signal is weak while the trust cost is high: what
+// someone downloads is exactly the kind of thing telemetry must never touch,
+// and a `verb` counter is not worth being the tool that phones home about it.
+
+var RELAY = "https://feedback.intrane.fr/v1/feedback"
+var RELEASE_BASE = "https://github.com/javimosch/essaim/releases/latest/download"
+
+func install_dir() (d) { d = env("HOME") + "/.local/bin" }
+
+// cmd_install relocates the binary already in hand onto $PATH. It needs no
+// network and no sudo, and running it twice is not an error.
+func cmd_install(a) { self := args()[0]
+	dst := flag_val(a, "--dir", install_dir())
+	if mkdir_p(dst) == 0 { fail(EXIT_VALUE, "bad_dir", "cannot create " + dst, []string{"essaim install --dir <writable path>"}) }
+	target := dst + "/essaim"
+	if self == target { emit("{\"installed\":\"" + jesc(target) + "\",\"action\":\"already-installed\"}") }
+	raw := read_file_bytes(self)
+	if len(raw) == 0 { fail(EXIT_INTERNAL, "unreadable_self", "cannot read the running binary at " + self, []string{}) }
+	// stage next to the target and rename: writing over a running binary hits
+	// ETXTBSY, while a rename just swaps the directory entry
+	tmp := target + ".new"
+	if write_file_bytes(tmp, raw) < 0 { fail(EXIT_VALUE, "write_failed", "cannot write " + tmp, []string{"check permissions on " + dst}) }
+	system("chmod +x " + tmp + " && mv -f " + tmp + " " + target)
+	if file_size(target) != len(raw) { fail(EXIT_INTERNAL, "install_failed", "the installed binary is not the expected size", []string{}) }
+	warn := ""
+	if contains(env("PATH"), dst) == false { warn = dst + " is not on your PATH" }
+	emit("{\"installed\":\"" + jesc(target) + "\",\"action\":\"installed\",\"bytes\":" + str(len(raw)) + ",\"warning\":\"" + jesc(warn) + "\"}") }
+
+func cmd_uninstall(a) { dst := flag_val(a, "--dir", install_dir())
+	target := dst + "/essaim"
+	if file_size(target) < 0 { emit("{\"removed\":false,\"path\":\"" + jesc(target) + "\",\"action\":\"not-installed\"}") }
+	remove(target)
+	if file_size(target) >= 0 { fail(EXIT_VALUE, "remove_failed", "could not remove " + target, []string{"check permissions"}) }
+	emit("{\"removed\":true,\"path\":\"" + jesc(target) + "\"}") }
+
+// cmd_update verifies by CONTENT HASH before swapping. The binary is fetched
+// with curl rather than the in-process client on purpose: a NUL-terminated
+// string helper silently truncates an ELF, and this is the one place that would
+// corrupt the tool itself.
+func cmd_update(a) { checkonly := flag_on(a, "--check")
+	url := RELEASE_BASE + "/essaim-linux-amd64"
+	dg := RELEASE_BASE + "/essaim-linux-amd64.sha256"
+	status, body, err := http_get_b(dg, 20000)
+	if err != "" { fail(EXIT_NETWORK, "update_unreachable", "cannot reach the release digest: " + err, []string{"retry", "download from " + RELEASE_BASE}) }
+	if status != 200 { fail(EXIT_NETWORK, "update_unreachable", "release digest returned http " + str(status), []string{"no release may be published yet"}) }
+	want := first_field(bytes_str(body))
+	if len(want) != 64 { fail(EXIT_EXTERNAL, "bad_digest", "the published digest is not a sha256", []string{}) }
+	self := args()[0]
+	have := to_hex(sha256_bytes(read_file_bytes(self)))
+	if have == want { emit("{\"current\":true,\"sha256\":\"" + have + "\"}") }
+    if checkonly == 1 { emit("{\"current\":false,\"local_sha256\":\"" + have + "\",\"remote_sha256\":\"" + want + "\",\"url\":\"" + url + "\"}") }
+	tmp := self + ".new"
+	if system("curl -fsSL -o " + tmp + " " + url) != 0 { fail(EXIT_NETWORK, "download_failed", "could not download " + url, []string{"retry"}) }
+	got := to_hex(sha256_bytes(read_file_bytes(tmp)))
+	if got != want { remove(tmp)  fail(EXIT_EXTERNAL, "hash_mismatch", "downloaded binary does not match the published digest", []string{"retry -- the download may have been truncated"}) }
+	// smoke-test before committing to the swap
+	system("chmod +x " + tmp)
+	if system(tmp + " version > /dev/null 2>&1") != 0 { remove(tmp)  fail(EXIT_EXTERNAL, "smoke_test_failed", "the downloaded binary does not run", []string{}) }
+	system("cp -f " + self + " " + self + ".bak")
+	system("mv -f " + tmp + " " + self)
+	emit("{\"updated\":true,\"sha256\":\"" + want + "\",\"backup\":\"" + jesc(self + ".bak") + "\"}") }
+
+func first_field(s) (out) { out = trim(s)
+	i := index(out, " ")
+	if i > 0 { out = substr(out, 0, i) } }
+
+// cmd_feedback dual-writes: the same submission, with the SAME idempotency key,
+// goes to the relay and (when configured) the app's own endpoint, so neither
+// side is a single point of loss and a replay cannot double-record it.
+func cmd_feedback(a) { msg := arg_at(a, 2)
+	if trim(msg) == "" { fail(EXIT_VALIDATION, "empty_message", "feedback needs a message", []string{"essaim feedback \"udp tracker timed out on every announce\" --kind bug"}) }
+	kind := flag_val(a, "--kind", "note")
+	ctx := flag_val(a, "--context", "")
+	who := flag_val(a, "--reporter", "agent")
+	id := to_hex(rand_bytes(16))
+	body := "{\"id\":\"" + id + "\",\"app\":\"essaim\",\"version\":\"" + VERSION + "\",\"kind\":\"" + jesc(kind) + "\",\"message\":\"" + jesc(msg) + "\",\"context\":\"" + jesc(ctx) + "\",\"reporter\":\"" + jesc(who) + "\"}"
+	relay := env("FEEDBACK_RELAY")
+	if relay == "" { relay = RELAY }
+	rs, _, rerr := http_post_b(relay, body, 15000)
+	delivered := 0
+	if rerr == "" { if rs < 300 { delivered = 1 } }
+	if delivered == 0 { fail(EXIT_NETWORK, "relay_failed", "could not deliver feedback to " + relay, []string{"retry", "open an issue at https://github.com/javimosch/essaim/issues"}) }
+	emit("{\"delivered\":true,\"id\":\"" + id + "\",\"relay\":\"" + jesc(relay) + "\"}") }

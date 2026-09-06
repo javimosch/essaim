@@ -23,13 +23,18 @@ func fill(fd, buf, n) (out, ok) { out = buf  ok = 1
 // peer_handshake performs the 68-byte exchange and checks the peer answered for
 // the SAME infohash. A peer that answers for a different swarm is not an error
 // to retry -- it is the wrong peer, so the session ends.
-func peer_handshake(fd, infohash, peerid) (buf, ok) { buf = bytes("")  ok = 0
-	hs := bytes_concat(from_hex("13" + to_hex(bytes("BitTorrent protocol")) + "0000000000000000" + infohash + peerid), bytes(""))
-	if write_bytes(fd, hs) < 68 { return buf, ok }
+// The reserved field advertises the extension protocol (BEP 10) by setting bit
+// 0x10 of byte 5. It costs nothing when the peer does not speak it, and it is
+// what makes BEP 9 metadata exchange -- and therefore magnet links -- possible.
+func peer_handshake(fd, infohash, peerid) (buf, ok, ext) { buf = bytes("")  ok = 0  ext = 0
+	hs := from_hex("13" + to_hex(bytes("BitTorrent protocol")) + "0000000000100000" + infohash + peerid)
+	if write_bytes(fd, hs) < 68 { return buf, ok, ext }
 	buf, got := fill(fd, bytes(""), 68)
-	if got == 0 { return buf, ok }
-	if rd8(buf, 0) != 19 { return buf, ok }
-	if to_hex(bytes_sub(buf, 28, 48)) != infohash { return buf, ok }
+	if got == 0 { return buf, ok, ext }
+	if rd8(buf, 0) != 19 { return buf, ok, ext }
+	if to_hex(bytes_sub(buf, 28, 48)) != infohash { return buf, ok, ext }
+	r5 := rd8(buf, 25)
+	if (r5 / 16) - ((r5 / 16) / 2) * 2 == 1 { ext = 1 }
 	buf = bytes_sub(buf, 68, len(buf))
 	ok = 1 }
 

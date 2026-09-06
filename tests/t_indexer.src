@@ -1,0 +1,95 @@
+var g_fail = 0
+
+func expect(name, got, want) { if got == want { println("ok   " + name)  return }
+	println("FAIL " + name + "\n  got  " + got + "\n  want " + want)
+	g_fail = g_fail + 1 }
+
+// Fixtures, so index parsing is tested without the network. These are the exact
+// response shapes the real sources return.
+func fx_apibay() (s) { s = "[{\"name\":\"Ubuntu 22.04\",\"info_hash\":\"2C6B6858D61DA9543D4231A71DB4B1C9264B0685\",\"size\":\"3654957056\",\"seeders\":\"37\"},{\"name\":\"Debian Netinst\",\"info_hash\":\"aabbccddeeff00112233445566778899aabbccdd\",\"size\":\"400\",\"seeders\":\"5\"}]" }
+
+func fx_nyaa() (s) { s = "<rss><channel><item><title>[Grp] One Piece 1177</title><nyaa:infoHash>45008e48c8800b7d7643337b2e70a634e4c69f6a</nyaa:infoHash><nyaa:size>1.4 GiB</nyaa:size><nyaa:seeders>42</nyaa:seeders></item><item><title>Unrelated Show 01</title><nyaa:infoHash>1111111111111111111111111111111111111111</nyaa:infoHash><nyaa:seeders>7</nyaa:seeders></item></channel></rss>" }
+
+func fx_archive() (s) { s = "{\"items\":[{\"identifier\":\"apollo-11\",\"item_size\":7158024},{\"identifier\":\"gemini-4\",\"item_size\":123}],\"total\":2}" }
+
+func src_apibay() (s) { s = Source{name: "piratebay", kind: "json", cat: "all", url: "x", mode: "index", probe: ".[{i}].name", f_name: ".[{i}].name", f_hash: ".[{i}].info_hash", f_size: ".[{i}].size", f_seed: ".[{i}].seeders", enabled: 1} }
+
+func src_nyaa() (s) { s = Source{name: "nyaa", kind: "rss", cat: "anime", url: "x", mode: "item", probe: "<title>([^<]*)</title>", f_name: "<title>([^<]*)</title>", f_hash: "<nyaa:infoHash>([0-9a-fA-F]{40})</nyaa:infoHash>", f_size: "<nyaa:size>([^<]*)</nyaa:size>", f_seed: "<nyaa:seeders>([0-9]+)</nyaa:seeders>", enabled: 1} }
+
+func src_archive() (s) { s = Source{name: "archive", kind: "json", cat: "all", url: "x", mode: "index", probe: ".items[{i}].identifier", f_name: ".items[{i}].identifier", f_hash: "", f_size: ".items[{i}].item_size", f_seed: "", f_link: "https://archive.org/download/{v}/{v}_archive.torrent", enabled: 1} }
+
+func main() { j := scan_json(src_apibay(), fx_apibay(), "", 10)
+	expect("json-n", str(len(j)), "2")
+	if len(j) > 0 { expect("json-name", j[0].name, "Ubuntu 22.04")
+		// the index returns an UPPERCASE hash; it must be normalized, or the
+		// handshake and tracker announce would use a different identity
+		expect("json-hash-lowered", j[0].infohash, "2c6b6858d61da9543d4231a71db4b1c9264b0685")
+		expect("json-size", str(j[0].size), "3654957056")
+		expect("json-seeders", str(j[0].seeders), "37")
+		expect("json-magnet", str(has_prefix(j[0].magnet, "magnet:?xt=urn:btih:2c6b6858")), "true")
+		expect("json-magnet-trackers", str(contains(j[0].magnet, "tr=udp")), "true") }
+	// limit is honoured
+	expect("json-limit", str(len(scan_json(src_apibay(), fx_apibay(), "", 1))), "1")
+	// RSS
+	r := scan_rss(src_nyaa(), fx_nyaa(), "", 10)
+	expect("rss-n", str(len(r)), "2")
+	if len(r) > 0 { expect("rss-name", r[0].name, "[Grp] One Piece 1177")
+		expect("rss-hash", r[0].infohash, "45008e48c8800b7d7643337b2e70a634e4c69f6a")
+		expect("rss-seeders", str(r[0].seeders), "42") }
+	// local filtering narrows a firehose source; every term must appear
+	lf := Source{name: "x", kind: "json", cat: "all", url: "x", mode: "index", probe: ".[{i}].name", f_name: ".[{i}].name", f_hash: ".[{i}].info_hash", f_size: ".[{i}].size", f_seed: ".[{i}].seeders", filter: "local", enabled: 1}
+	expect("filter-hit", str(len(scan_json(lf, fx_apibay(), "ubuntu", 10))), "1")
+	expect("filter-miss", str(len(scan_json(lf, fx_apibay(), "nothinghere", 10))), "0")
+	expect("filter-two-terms", str(len(scan_json(lf, fx_apibay(), "debian netinst", 10))), "1")
+	expect("filter-partial-terms", str(len(scan_json(lf, fx_apibay(), "debian ubuntu", 10))), "0")
+	expect("filter-off-passes-all", str(len(scan_json(src_apibay(), fx_apibay(), "nothinghere", 10))), "2")
+	expect("qmatch-empty", str(q_match("local", "anything", "")), "1")
+	// a link-only source yields a .torrent URL and no magnet
+	ar := scan_json(src_archive(), fx_archive(), "", 10)
+	expect("link-n", str(len(ar)), "2")
+	if len(ar) > 0 { expect("link-url", ar[0].torrent, "https://archive.org/download/apollo-11/apollo-11_archive.torrent")
+		expect("link-nohash", ar[0].infohash, "")
+		expect("link-nomagnet", ar[0].magnet, "")
+		expect("link-size", str(ar[0].size), "7158024") }
+	// dedupe: same infohash from two sources collapses, different ones do not
+	pool := []Hit{}
+	h1 := Hit{source: "a", infohash: "ff", torrent: ""}
+	h2 := Hit{source: "b", infohash: "ff", torrent: ""}
+	h3 := Hit{source: "c", infohash: "ee", torrent: ""}
+	expect("dedupe-first", str(hit_new(pool, h1)), "1")
+	pool = append(pool, h1)
+	expect("dedupe-same", str(hit_new(pool, h2)), "0")
+	expect("dedupe-other", str(hit_new(pool, h3)), "1")
+	// link-only rows dedupe on the URL instead
+	lp := []Hit{Hit{source: "a", infohash: "", torrent: "u1"}}
+	expect("dedupe-link-same", str(hit_new(lp, Hit{source: "b", infohash: "", torrent: "u1"})), "0")
+	expect("dedupe-link-other", str(hit_new(lp, Hit{source: "b", infohash: "", torrent: "u2"})), "1")
+	// category routing
+	expect("cat-all", str(cat_match("anime", "all")), "1")
+	expect("cat-exact", str(cat_match("anime", "anime")), "1")
+	expect("cat-miss", str(cat_match("anime", "movies")), "0")
+	expect("cat-source-all", str(cat_match("all", "movies")), "1")
+	// redirect resolution, which archive.org's /download/ 302 depends on
+	expect("abs-absolute", abs_url("https://a.org/x/y", "https://b.org/z"), "https://b.org/z")
+	expect("abs-rooted", abs_url("https://a.org/x/y", "/z"), "https://a.org/z")
+	expect("abs-relative", abs_url("https://a.org/x/y", "z"), "https://a.org/x/z")
+	expect("abs-port", abs_url("http://a.org:8080/x/y", "/z"), "http://a.org:8080/z")
+	expect("is-redirect-302", str(is_redirect(302)), "1")
+	expect("is-redirect-200", str(is_redirect(200)), "0")
+	expect("is-redirect-308", str(is_redirect(308)), "1")
+	loc := bytes("HTTP/1.1 302 Found\r\nLocation: https://ia1.example/x.torrent\r\nServer: n\r\n\r\n")
+	expect("header-location", header_of(loc, "location"), "https://ia1.example/x.torrent")
+	expect("header-missing", header_of(loc, "nope"), "")
+	// sources table is the config surface: every row must be well formed
+	all := sources_default()
+	expect("sources-count", str(len(all)), "6")
+	i := 0
+	bad := 0
+	for i < len(all) { if all[i].name == "" { bad = bad + 1 }
+		if all[i].url == "" { bad = bad + 1 }
+		if contains(all[i].url, "{q}") == false { if all[i].kind == "json" { bad = bad + 1 } }
+		if all[i].probe == "" { bad = bad + 1 }
+		i = i + 1 }
+	expect("sources-wellformed", str(bad), "0")
+	if g_fail == 0 { println("\nALL PASS") }
+	if g_fail > 0 { println("\n" + str(g_fail) + " FAILED")  exit(1) } }

@@ -24,7 +24,33 @@ func main() { a := args()
 	if cmd == "help-json" { cmd_help_json() }
 	if cmd == "info" { cmd_info(a) }
 	if cmd == "get" { cmd_get(a) }
+	if cmd == "search" { cmd_search(a) }
+	if cmd == "sources" { cmd_sources() }
 	fail(EXIT_ARGS, "unknown_command", "no such command: " + cmd, []string{"essaim help-json", "essaim guide"}) }
+
+func cmd_sources() { srcs := sources_default()
+	rows := []string{}
+	i := 0
+	for i < len(srcs) { rows = append(rows, "{\"name\":\"" + srcs[i].name + "\",\"kind\":\"" + srcs[i].kind + "\",\"category\":\"" + srcs[i].cat + "\",\"enabled\":" + boolstr(srcs[i].enabled) + "}")
+		i = i + 1 }
+	emit("{\"sources\":[" + join(rows, ",") + "]}") }
+
+func cmd_search(a) { q := arg_at(a, 2)
+	if q == "" { fail(EXIT_ARGS, "missing_argument", "search needs a query", []string{"essaim search \"ubuntu\"", "essaim search \"one piece\" --cat anime"}) }
+	if has_prefix(q, "--") { fail(EXIT_ARGS, "missing_argument", "search needs a query before its flags", []string{"essaim search \"ubuntu\" --cat movies"}) }
+	cat := flag_val(a, "--cat", "all")
+	limit := parse_int(flag_val(a, "--limit", "25"))
+	timeout := parse_int(flag_val(a, "--timeout", "15000"))
+	quiet := flag_on(a, "--quiet")
+	progress := 1
+	if quiet == 1 { progress = 0 }
+	hits := search_all(sources_default(), q, cat, limit, timeout, progress)
+	rows := []string{}
+	i := 0
+	for i < len(hits) { h := hits[i]
+		rows = append(rows, "{\"source\":\"" + h.source + "\",\"name\":\"" + jesc(h.name) + "\",\"infohash\":\"" + h.infohash + "\",\"size_bytes\":" + str(h.size) + ",\"seeders\":" + str(h.seeders) + ",\"magnet\":\"" + jesc(h.magnet) + "\",\"torrent\":\"" + jesc(h.torrent) + "\"}")
+		i = i + 1 }
+	emit("{\"query\":\"" + jesc(q) + "\",\"category\":\"" + cat + "\",\"count\":" + str(len(hits)) + ",\"results\":[" + join(rows, ",") + "]}") }
 
 // source_bytes resolves a torrent argument to the raw bytes of a .torrent.
 // A magnet is accepted by the parser but cannot be downloaded yet: its metadata
@@ -73,18 +99,21 @@ func cmd_get(a) { src := arg_at(a, 2)
 	deadline := parse_int(flag_val(a, "--deadline", "600000"))
 	port := parse_int(flag_val(a, "--port", "6881"))
 	quiet := flag_on(a, "--quiet")
-	raw, err := source_bytes(src)
-	if err == "magnet" { fail(EXIT_VALIDATION, "magnet_unsupported", "magnets need the metadata exchange (BEP 9), which this build does not have yet; use a .torrent file", []string{"essaim get ./file.torrent"}) }
+	progress := 1
+	if quiet == 1 { progress = 0 }
+	pid := peer_id_new()
+	raw := bytes("")
+	err := ""
+	peers := []Peer{}
+	if has_prefix(src, "magnet:") { raw, peers = resolve_magnet(src, pid, port, timeout, progress) }
+	if has_prefix(src, "magnet:") == false { raw, err = source_bytes(src) }
 	if err == "notfound" { fail(EXIT_NOTFOUND, "not_found", "cannot read " + src, []string{"check the path"}) }
 	if err != "" { fail(EXIT_NETWORK, "fetch_failed", "could not fetch " + src + ": " + err, []string{"retry"}) }
 	t := torrent_parse(raw)
 	if t.ok == 0 { fail(EXIT_VALUE, "bad_torrent", t.err, []string{"the file may be html, not a .torrent"}) }
 	if mkdir_p(dir) == 0 { fail(EXIT_VALUE, "bad_dir", "cannot create " + dir, []string{"pick a writable --dir"}) }
-	progress := 1
-	if quiet == 1 { progress = 0 }
 	if progress == 1 { eprint("essaim: " + t.name + " -- " + str(t.total) + " bytes in " + str(t.npieces) + " pieces") }
-	pid := peer_id_new()
-	peers := gather_peers(t, pid, port, timeout, progress)
+	if len(peers) == 0 { peers = gather_peers(t.announce, t.infohash, t.total, pid, port, timeout, progress) }
 	if len(peers) == 0 { fail(EXIT_NETWORK, "no_peers", "no tracker returned a peer for " + t.infohash, []string{"retry -- swarms are intermittent", "check network reachability to udp trackers"}) }
 	if progress == 1 { eprint("essaim: " + str(len(peers)) + " peers, starting") }
 	s := engine_download(t, dir, peers, pid, timeout, deadline, progress)
@@ -94,16 +123,30 @@ func cmd_get(a) { src := arg_at(a, 2)
 		exit(EXIT_EXTERNAL) }
 	emit(body) }
 
+// resolve_magnet turns a magnet into a real .torrent document by asking the
+// swarm for its metadata (BEP 9). The peers found along the way are reused for
+// the download itself, so the tracker is not announced to twice.
+func resolve_magnet(src, pid, port, timeout, progress) (raw, peers) { raw = bytes("")  peers = []Peer{}
+	m := magnet_parse(src)
+	if m.ok == 0 { fail(EXIT_VALUE, "bad_magnet", m.err, []string{"check the xt=urn:btih: parameter"}) }
+	if len(m.announce) == 0 { fail(EXIT_VALIDATION, "magnet_no_trackers", "this magnet lists no trackers and essaim has no DHT yet, so there is nowhere to find peers", []string{"use a magnet with &tr= trackers", "use a .torrent file instead"}) }
+	if progress == 1 { eprint("essaim: magnet " + m.infohash + " -- asking the swarm for metadata") }
+	peers = gather_peers(m.announce, m.infohash, 1048576, pid, port, timeout, progress)
+	if len(peers) == 0 { fail(EXIT_NETWORK, "no_peers", "no tracker returned a peer for " + m.infohash, []string{"retry -- swarms are intermittent"}) }
+	r, err := meta_from_swarm(peers, m.infohash, pid, timeout, progress)
+	if err != "" { fail(EXIT_EXTERNAL, "metadata_failed", "could not fetch metadata from any peer: " + err, []string{"retry -- another peer may serve it", "use a .torrent file instead"}) }
+	raw = r }
+
 func boolstr(v) (s) { s = "false"
 	if v == 1 { s = "true" } }
 
 // gather_peers announces to each tracker in turn and pools the results. It stops
 // as soon as it has a workable swarm rather than announcing to every tracker,
 // since each dead one costs a full timeout.
-func gather_peers(t, pid, port, timeout, progress) (peers) { peers = []Peer{}
+func gather_peers(announce, infohash, left, pid, port, timeout, progress) (peers) { peers = []Peer{}
 	i := 0
-	for i < len(t.announce) { u := t.announce[i]
-		a := tracker_announce(u, t.infohash, pid, port, t.total, timeout)
+	for i < len(announce) { u := announce[i]
+		a := tracker_announce(u, infohash, pid, port, left, timeout)
 		if a.ok == 1 { j := 0
 			for j < len(a.peers) { if peer_new(peers, a.peers[j]) == 1 { peers = append(peers, a.peers[j]) }  j = j + 1 }
 			if progress == 1 { eprint("essaim: " + u + " -> " + str(len(a.peers)) + " peers (" + str(a.seeders) + " seeders)") } }

@@ -1,0 +1,137 @@
+// Search across torrent indexes.
+//
+// A source is a CONFIG ROW, not code. Adding one is a table entry: the URL
+// template, how to walk the response, and where the fields live. Two shapes
+// cover every index worth querying -- a JSON API addressed by path templates
+// (with {i} standing for the row index), and an RSS/XML feed split on <item>
+// and read with regexes.
+//
+// Every result is normalized to the same row: name, infohash, size, seeders,
+// and a magnet built from the infohash. The infohash is the only field that
+// matters for downloading -- everything else is presentation.
+
+// filter "local" means the index ignores the query and returns a firehose, so
+// essaim narrows the rows itself. EZTV's API only filters by IMDb id, and
+// SubsPlease's feed has no query at all -- without this they would answer every
+// search with the same latest-releases list.
+type Source struct { name string  kind string  cat string  url string  mode string  probe string  f_name string  f_hash string  f_size string  f_seed string  f_link string  filter string  enabled int }
+
+// f_link lets a source return a .torrent URL instead of an infohash. Not every
+// index publishes hashes -- archive.org, for one, addresses items by identifier
+// -- and `essaim get` already accepts a URL, so a link is just as downloadable.
+// "{v}" in the template is replaced by the row's probe value.
+
+// The default trackers stapled onto a constructed magnet. An index gives an
+// infohash; peers still have to be found, and without a DHT that means trackers.
+func default_trackers() (t) { t = []string{"udp://tracker.opentrackr.org:1337/announce", "udp://open.demonii.com:1337/announce", "udp://tracker.torrent.eu.org:451/announce", "udp://exodus.desync.com:6969/announce"} }
+
+// sources_default is torlink's curated set, expressed declaratively. Each row is
+// data: no source has any code of its own.
+func sources_default() (s) { s = []Source{}
+	s = append(s, Source{name: "piratebay", kind: "json", cat: "all", url: "https://apibay.org/q.php?q={q}", mode: "index", probe: ".[{i}].name", f_name: ".[{i}].name", f_hash: ".[{i}].info_hash", f_size: ".[{i}].size", f_seed: ".[{i}].seeders", enabled: 1})
+	s = append(s, Source{name: "yts", kind: "json", cat: "movies", url: "https://yts.mx/api/v2/list_movies.json?limit=30&query_term={q}", mode: "index", probe: ".data.movies[{i}].title_long", f_name: ".data.movies[{i}].title_long", f_hash: ".data.movies[{i}].torrents[0].hash", f_size: ".data.movies[{i}].torrents[0].size_bytes", f_seed: ".data.movies[{i}].torrents[0].seeds", enabled: 1})
+	s = append(s, Source{name: "nyaa", kind: "rss", cat: "anime", url: "https://nyaa.si/?page=rss&q={q}", mode: "item", probe: "<title>([^<]*)</title>", f_name: "<title>([^<]*)</title>", f_hash: "<nyaa:infoHash>([0-9a-fA-F]{40})</nyaa:infoHash>", f_size: "<nyaa:size>([^<]*)</nyaa:size>", f_seed: "<nyaa:seeders>([0-9]+)</nyaa:seeders>", enabled: 1})
+	s = append(s, Source{name: "subsplease", kind: "rss", cat: "anime", url: "https://subsplease.org/rss/?t&r=1080p", mode: "item", probe: "<title>([^<]*)</title>", f_name: "<title>([^<]*)</title>", f_hash: "btih:([0-9a-fA-F]{40})", f_size: "<size>([^<]*)</size>", f_seed: "<seeders>([0-9]+)</seeders>", filter: "local", enabled: 1})
+	s = append(s, Source{name: "archive", kind: "json", cat: "all", url: "https://archive.org/services/search/v1/scrape?q=format%3A%22Archive+BitTorrent%22+AND+%28{q}%29&count=100&fields=identifier,item_size", mode: "index", probe: ".items[{i}].identifier", f_name: ".items[{i}].identifier", f_hash: "", f_size: ".items[{i}].item_size", f_seed: "", f_link: "https://archive.org/download/{v}/{v}_archive.torrent", enabled: 1})
+	s = append(s, Source{name: "eztv", kind: "json", cat: "tv", url: "https://eztvx.to/api/get-torrents?limit=50&keywords={q}", mode: "index", probe: ".torrents[{i}].title", f_name: ".torrents[{i}].title", f_hash: ".torrents[{i}].hash", f_size: ".torrents[{i}].size_bytes", f_seed: ".torrents[{i}].seeds", filter: "local", enabled: 1}) }
+
+type Hit struct { source string  name string  infohash string  size int  seeders int  magnet string  torrent string }
+
+// search_all queries every enabled source whose category matches and pools the
+// hits. A source that errors is SKIPPED with a note on stderr, never fatal: one
+// dead index must not sink a search.
+func search_all(srcs, q, cat, limit, timeout, progress) (hits) { hits = []Hit{}
+	i := 0
+	for i < len(srcs) { s := srcs[i]
+		if s.enabled == 1 { if cat_match(s.cat, cat) == 1 { got := search_one(s, q, limit, timeout, progress)
+				j := 0
+				for j < len(got) { if hit_new(hits, got[j]) == 1 { hits = append(hits, got[j]) }  j = j + 1 }
+				if progress == 1 { eprint("essaim: " + s.name + " -> " + str(len(got)) + " hits") } } }
+		i = i + 1 } }
+
+func cat_match(scat, want) (m) { m = 0
+	if want == "" { m = 1  return m }
+	if want == "all" { m = 1  return m }
+	if scat == "all" { m = 1  return m }
+	if scat == want { m = 1 } }
+
+// Dedupe on the infohash when there is one; a link-only source dedupes on its
+// URL instead, since two indexes can carry the same item under different names.
+func hit_new(list, h) (isnew) { isnew = 1
+	i := 0
+	for i < len(list) { if h.infohash != "" { if list[i].infohash == h.infohash { isnew = 0  return isnew } }
+		if h.infohash == "" { if list[i].torrent == h.torrent { isnew = 0  return isnew } }
+		i = i + 1 } }
+
+func search_one(s, q, limit, timeout, progress) (out) { out = []Hit{}
+	u := replace(s.url, "{q}", url_encode(q))
+	status, body, err := http_get_b(u, timeout)
+	if err != "" { if progress == 1 { eprint("essaim: " + s.name + " unreachable (" + err + ")") }  return out }
+	if status != 200 { if progress == 1 { eprint("essaim: " + s.name + " http " + str(status)) }  return out }
+	txt := bytes_str(body)
+	if s.kind == "json" { out = scan_json(s, txt, q, limit)  return out }
+	if s.kind == "rss" { out = scan_rss(s, txt, q, limit) } }
+
+func scan_json(s, txt, q, limit) (out) { out = []Hit{}
+	i := 0
+	scanned := 0
+	for scanned < limit * 8 { scanned = scanned + 1
+		if len(out) >= limit { return out }
+		probe := jstr_at(txt, replace(s.probe, "{i}", str(i)))
+		if probe == "" { return out }
+		ih := ""
+		if s.f_hash != "" { ih = to_lower(jstr_at(txt, replace(s.f_hash, "{i}", str(i)))) }
+		usable := 0
+		if len(ih) == 40 { usable = 1 }
+		if s.f_link != "" { usable = 1 }
+		if usable == 1 { if q_match(s.filter, probe, q) == 1 { h := Hit{source: s.name, name: probe, infohash: ih, size: parse_int(jstr_at(txt, replace(s.f_size, "{i}", str(i))))}
+				if s.f_seed != "" { h.seeders = parse_int(jstr_at(txt, replace(s.f_seed, "{i}", str(i)))) }
+				if len(ih) == 40 { h.magnet = magnet_build(ih, probe) }
+				if s.f_link != "" { h.torrent = replace(s.f_link, "{v}", probe) }
+				out = append(out, h) } }
+		i = i + 1 } }
+
+// q_match narrows a firehose source locally: every whitespace-separated term of
+// the query must appear in the name, case-insensitively.
+func q_match(filter, name, q) (m) { m = 1
+	if filter != "local" { return m }
+	if q == "" { return m }
+	lname := to_lower(name)
+	terms := split(to_lower(q), " ")
+	i := 0
+	for i < len(terms) { if terms[i] != "" { if contains(lname, terms[i]) == false { m = 0  return m } }
+		i = i + 1 } }
+
+// jstr_at reads a path and strips the quotes json_get leaves on a string token,
+// so a numeric and a string field read the same way.
+func jstr_at(j, path) (out) { out = ""
+	v, e := json_get(j, path)
+	if e != "" { return out }
+	if len(v) >= 2 { if charat(v, 0) == "\"" { out = substr(v, 1, len(v) - 1)  return out } }
+	out = v }
+
+// RSS is split on <item> and each field pulled with its regex. A feed with no
+// query support (subsplease) is filtered locally against the query terms.
+func scan_rss(s, txt, q, limit) (out) { out = []Hit{}
+	parts := split(txt, "<item>")
+	i := 1
+	for i < len(parts) { if len(out) >= limit { return out }
+		item := parts[i]
+		name := regex_1(item, s.f_name)
+		ih := to_lower(regex_1(item, s.f_hash))
+		if len(ih) == 40 { if q_match(s.filter, name, q) == 1 { out = append(out, rss_hit(s, name, ih, item)) } }
+		i = i + 1 } }
+
+func rss_hit(s, name, ih, item) (h) { h = Hit{source: s.name, name: name, infohash: ih, size: 0, seeders: parse_int(regex_1(item, s.f_seed))}
+	h.magnet = magnet_build(ih, name) }
+
+func regex_1(s, pat) (out) { out = ""
+	g := regex_groups(s, pat)
+	if len(g) > 1 { out = g[1] } }
+
+// magnet_build staples the default trackers on, because an infohash alone has
+// nowhere to find peers without a DHT.
+func magnet_build(ih, name) (m) { m = "magnet:?xt=urn:btih:" + ih + "&dn=" + url_encode(name)
+	tr := default_trackers()
+	i := 0
+	for i < len(tr) { m = m + "&tr=" + url_encode(tr[i])  i = i + 1 } }

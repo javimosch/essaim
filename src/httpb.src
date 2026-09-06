@@ -27,10 +27,50 @@ func url_parse(u) (r) { r = Url{scheme: "http", port: 80, path: "/", ok: 0}
 	if r.port <= 0 { return r }
 	r.ok = 1 }
 
-// http_get_b performs the GET and returns (status, body bytes, err). err is ""
-// on any HTTP response -- a 404 is a RESULT, not an error -- and one of
-// "url"/"connect"/"tls"/"timeout" when no response was obtained at all.
+// http_get_b performs the GET, following redirects, and returns (status, body,
+// err). err is "" on any HTTP response -- a 404 is a RESULT, not an error -- and
+// one of "url"/"connect"/"tls"/"timeout"/"redirect" when no response was
+// obtained at all.
+//
+// Redirects have to be followed: archive.org answers /download/ with a 302 to
+// whichever node holds the item, and a client that stops at the 302 can never
+// fetch a .torrent from it.
 func http_get_b(u, timeout_ms) (status, body, err) { status = 0  body = bytes("")  err = ""
+	cur := u
+	hop := 0
+	for hop < 6 { status, body, err = http_get_once(cur, timeout_ms)
+		if err != "" { return status, body, err }
+		if is_redirect(status) == 0 { return status, body, err }
+		loc := header_value(body, "")
+		if loc == "" { err = "redirect"  return status, body, err }
+		cur = abs_url(cur, loc)
+		hop = hop + 1 }
+	err = "redirect" }
+
+func is_redirect(status) (yes) { yes = 0
+	if status == 301 { yes = 1 }
+	if status == 302 { yes = 1 }
+	if status == 303 { yes = 1 }
+	if status == 307 { yes = 1 }
+	if status == 308 { yes = 1 } }
+
+// abs_url resolves a Location against the URL it came from: absolute URLs are
+// taken as-is, "/path" keeps the origin, anything else is relative to the
+// current directory.
+func abs_url(base, loc) (out) { out = loc
+	if has_prefix(loc, "http://") { return out }
+	if has_prefix(loc, "https://") { return out }
+	b := url_parse(base)
+	origin := b.scheme + "://" + b.host
+	if b.port != 80 { if b.port != 443 { origin = origin + ":" + str(b.port) } }
+	if has_prefix(loc, "/") { out = origin + loc  return out }
+	dir := b.path
+	i := len(dir) - 1
+	for i >= 0 { if charat(dir, i) == "/" { dir = substr(dir, 0, i + 1)  break }
+		i = i - 1 }
+	out = origin + dir + loc }
+
+func http_get_once(u, timeout_ms) (status, body, err) { status = 0  body = bytes("")  err = ""
 	r := url_parse(u)
 	if r.ok == 0 { err = "url"  return status, body, err }
 	fd := dial(r.host, r.port)
@@ -52,8 +92,22 @@ func http_get_b(u, timeout_ms) (status, body, err) { status = 0  body = bytes(""
 		close(fd) }
 	if len(raw) == 0 { err = "timeout"  return status, body, err }
 	status = http_status(raw)
+	if is_redirect(status) == 1 { body = bytes(header_of(raw, "location"))  return status, body, err }
 	body = http_split_body(raw)
 	if http_is_chunked(raw) == 1 { body = dechunk(body) } }
+
+// header_of reads one header value out of a raw response, case-insensitively.
+func header_of(raw, name) (v) { v = ""
+	hdr_end := bytes_index(raw, bytes("\r\n\r\n"), 0)
+	if hdr_end < 0 { hdr_end = len(raw) }
+	lines := split(bytes_str(bytes_sub(raw, 0, hdr_end)), "\r\n")
+	i := 0
+	for i < len(lines) { c := index(lines[i], ":")
+		if c > 0 { if to_lower(trim(substr(lines[i], 0, c))) == name { v = trim(substr(lines[i], c + 1, len(lines[i])))  return v } }
+		i = i + 1 } }
+
+// On a redirect the body slot carries the Location, so the caller reads it back.
+func header_value(body, unused) (v) { v = bytes_str(body) }
 
 func http_status(raw) (code) { code = 0
 	sp := bytes_index(raw, bytes(" "), 0)

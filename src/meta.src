@@ -1,0 +1,76 @@
+// BEP 9: fetching a torrent's metadata from the swarm, which is what makes a
+// magnet link downloadable.
+//
+// A magnet carries an infohash and hints -- no piece hashes, no file list. Those
+// live in the `info` dictionary, and BEP 9 lets a peer send it to you over the
+// BEP 10 extension protocol in 16 KiB pieces. The result is self-verifying: the
+// SHA-1 of the assembled bytes MUST equal the infohash you asked for, so a peer
+// cannot feed you someone else's torrent.
+
+var META_PIECE = 16384
+
+// ut_metadata id we advertise for peers to send data back on.
+var MY_UT_METADATA = 1
+
+func ext_msg(extid, payload) (b) { body := bytes_concat(from_hex("14" + hex_of_byte(extid)), payload)
+	b = bytes_concat(from_hex(be32_hex(len(body))), body) }
+
+// meta_fetch pulls the info dict from one peer. err is "" on success.
+func meta_fetch(host, port, infohash, peerid, timeout) (info, err) { info = bytes("")  err = ""
+	fd := dial(host, port)
+	if fd < 0 { err = "connect failed"  return info, err }
+	socket_timeout(fd, timeout)
+	buf, ok, ext := peer_handshake(fd, infohash, peerid)
+	if ok == 0 { close(fd)  err = "handshake failed"  return info, err }
+	if ext == 0 { close(fd)  err = "peer has no extension protocol"  return info, err }
+	write_bytes(fd, ext_msg(0, bytes("d1:md11:ut_metadatai" + str(MY_UT_METADATA) + "eee")))
+	// Learn the peer's ut_metadata id and the metadata size from its extended
+	// handshake. Both are required before a single piece can be asked for.
+	utid := 0
+	size := 0
+	spins := 0
+	for size == 0 { spins = spins + 1
+		if spins > 256 { close(fd)  err = "peer never sent an extended handshake"  return info, err }
+		f := peer_msg(fd, buf)
+		buf = f.buf
+		if f.ok == 0 { close(fd)  err = "closed before extended handshake"  return info, err }
+		if f.id == 20 { if rd8(f.payload, 0) == 0 { j, _ := ben_parse_end(bytes_sub(f.payload, 1, len(f.payload)))
+				if j == "" { close(fd)  err = "bad extended handshake"  return info, err }
+				utid = jint(j, "m.ut_metadata")
+				size = jint(j, "metadata_size")
+				if utid == 0 { close(fd)  err = "peer does not serve metadata"  return info, err }
+				if size <= 0 { close(fd)  err = "peer reports no metadata"  return info, err }
+				if size > 8388608 { close(fd)  err = "metadata implausibly large"  return info, err } } } }
+	npieces := (size + META_PIECE - 1) / META_PIECE
+	i := 0
+	for i < npieces { write_bytes(fd, ext_msg(utid, bytes("d8:msg_typei0e5:piecei" + str(i) + "ee")))  i = i + 1 }
+	acc := bytes("")
+	guard := 0
+	for len(acc) < size { guard = guard + 1
+		if guard > npieces * 32 + 128 { close(fd)  err = "metadata transfer stalled"  return info, err }
+		f := peer_msg(fd, buf)
+		buf = f.buf
+		if f.ok == 0 { close(fd)  err = "closed mid-metadata"  return info, err }
+		if f.id == 20 { rest := bytes_sub(f.payload, 1, len(f.payload))
+			j, endpos := ben_parse_end(rest)
+			if j != "" { if jint(j, "msg_type") == 1 { if jint(j, "piece") == len(acc) / META_PIECE { acc = bytes_concat(acc, bytes_sub(rest, endpos, len(rest))) } }
+				// msg_type 2 is a reject: this peer will not serve that piece
+				if jint(j, "msg_type") == 2 { close(fd)  err = "peer rejected a metadata piece"  return info, err } } } }
+	close(fd)
+	if len(acc) > size { acc = bytes_sub(acc, 0, size) }
+	// self-verifying: the metadata IS the info dict, so its SHA-1 is the infohash
+	if to_hex(sha1_bytes(acc)) != infohash { err = "metadata failed infohash check"  return info, err }
+	info = acc }
+
+// meta_from_swarm tries peers in turn until one hands over valid metadata, then
+// rebuilds a full .torrent document around it so the normal parser can be used.
+func meta_from_swarm(peers, infohash, peerid, timeout, progress) (raw, err) { raw = bytes("")  err = "no peers to ask"
+	i := 0
+	for i < len(peers) { if i >= 12 { return raw, err }
+		info, e := meta_fetch(peers[i].ip, peers[i].port, infohash, peerid, timeout)
+		if e == "" { raw = bytes_concat(bytes_concat(bytes("d4:info"), info), bytes("e"))
+			err = ""
+			return raw, err }
+		if progress == 1 { eprint("essaim: metadata from " + peers[i].ip + ":" + str(peers[i].port) + " -> " + e) }
+		err = e
+		i = i + 1 } }

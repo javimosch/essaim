@@ -120,3 +120,11 @@ func ben_span(src, want) (start, stop) { start = -1  stop = -1
 		ben_value(src)
 		if g_ben_err == 1 { start = -1  stop = -1  return start, stop }
 		if k == want { start = vstart  stop = g_ben_pos  return start, stop } } }
+
+// ben_parse_end decodes ONE value and also reports where it ended. The BEP 9
+// data message is a bencode dict with the raw metadata bytes appended straight
+// after it, so the only way to find the payload is to know where the dict stops.
+func ben_parse_end(src) (out, endpos) { g_ben_pos = 0  g_ben_err = 0
+	out = ben_value(src)
+	endpos = g_ben_pos
+	if g_ben_err == 1 { out = ""  endpos = 0 } }

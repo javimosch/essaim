@@ -19,7 +19,7 @@ func peer_worker(host, pport, t, dir, infohash, peerid, work, res, timeout) { wh
 	fd := dial(host, pport)
 	if fd < 0 { res <- json(Res{kind: "gone", idx: 0 - 1, peer: who, err: "connect failed"})  return }
 	socket_timeout(fd, timeout)
-	buf, ok := peer_handshake(fd, infohash, peerid)
+	buf, ok, _ := peer_handshake(fd, infohash, peerid)
 	if ok == 0 { close(fd)  res <- json(Res{kind: "gone", idx: 0 - 1, peer: who, err: "handshake failed"})  return }
 	write_bytes(fd, msg_simple(2))
 	// Read until unchoked, learning the peer's bitfield on the way. A peer that

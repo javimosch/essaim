@@ -1,0 +1,92 @@
+// The BitTorrent peer wire protocol (BEP 3).
+//
+// A session is: handshake (68 bytes, both sides prove they mean the same
+// infohash), then a stream of length-prefixed messages. We are a pure leecher in
+// M0 -- announce interest, wait to be unchoked, then pull 16 KiB blocks until a
+// piece is whole, verify its SHA-1, and write it straight to disk at its offset.
+//
+// Everything here runs on a per-peer goroutine and owns its own socket and read
+// buffer. Nothing is shared: results leave over a channel, because a goroutine's
+// arena dies with it.
+
+var BLOCK = 16384
+
+type Frame struct { id int  payload bytes  buf bytes  ok int }
+
+// fill reads until the buffer holds at least n bytes. ok=0 means the peer hung
+// up or timed out -- there is no partial-message recovery, the session is done.
+func fill(fd, buf, n) (out, ok) { out = buf  ok = 1
+	for len(out) < n { c := read_bytes(fd)
+		if len(c) == 0 { ok = 0  return out, ok }
+		out = bytes_concat(out, c) } }
+
+// peer_handshake performs the 68-byte exchange and checks the peer answered for
+// the SAME infohash. A peer that answers for a different swarm is not an error
+// to retry -- it is the wrong peer, so the session ends.
+func peer_handshake(fd, infohash, peerid) (buf, ok) { buf = bytes("")  ok = 0
+	hs := bytes_concat(from_hex("13" + to_hex(bytes("BitTorrent protocol")) + "0000000000000000" + infohash + peerid), bytes(""))
+	if write_bytes(fd, hs) < 68 { return buf, ok }
+	buf, got := fill(fd, bytes(""), 68)
+	if got == 0 { return buf, ok }
+	if rd8(buf, 0) != 19 { return buf, ok }
+	if to_hex(bytes_sub(buf, 28, 48)) != infohash { return buf, ok }
+	buf = bytes_sub(buf, 68, len(buf))
+	ok = 1 }
+
+// peer_msg pulls one whole message. A zero-length message is a keep-alive, which
+// is reported as id -1 so the caller can ignore it without special framing code.
+func peer_msg(fd, buf) (f) { f = Frame{id: -2, payload: bytes(""), buf: buf, ok: 0}
+	b, ok := fill(fd, buf, 4)
+	if ok == 0 { f.buf = b  return f }
+	n := rd32(b, 0)
+	if n == 0 { f.id = -1  f.buf = bytes_sub(b, 4, len(b))  f.ok = 1  return f }
+	if n > 1048576 + 16 { f.buf = b  return f }
+	b2, ok2 := fill(fd, b, 4 + n)
+	if ok2 == 0 { f.buf = b2  return f }
+	f.id = rd8(b2, 4)
+	f.payload = bytes_sub(b2, 5, 4 + n)
+	f.buf = bytes_sub(b2, 4 + n, len(b2))
+	f.ok = 1 }
+
+func msg_simple(id) (b) { b = from_hex(be32_hex(1) + hex_of_byte(id)) }
+
+func msg_request(idx, begin, length) (b) { b = from_hex(be32_hex(13) + "06" + be32_hex(idx) + be32_hex(begin) + be32_hex(length)) }
+
+// bitfield_has reads bit idx of a bitfield payload, MSB first within each byte.
+func bitfield_has(bf, idx) (yes) { yes = 0
+	byteoff := idx / 8
+	if byteoff >= len(bf) { return yes }
+	bit := idx - byteoff * 8
+	v := rd8(bf, byteoff)
+	mask := 128
+	k := 0
+	for k < bit { mask = mask / 2  k = k + 1 }
+	if (v / mask) - ((v / mask) / 2) * 2 == 1 { yes = 1 } }
+
+// peer_fetch_piece requests every block of a piece and reassembles it. Blocks
+// are pipelined -- all requests go out before any reply is read -- because a
+// strictly serial request/response costs one full round trip per 16 KiB and
+// collapses throughput on a distant peer.
+func peer_fetch_piece(fd, buf, idx, plen, have) (data, outbuf, ok) { data = bytes("")  outbuf = buf  ok = 0
+	nblocks := (plen + BLOCK - 1) / BLOCK
+	i := 0
+	for i < nblocks { begin := i * BLOCK
+		l := BLOCK
+		if begin + l > plen { l = plen - begin }
+		if write_bytes(fd, msg_request(idx, begin, l)) <= 0 { return data, outbuf, ok }
+		i = i + 1 }
+	got := 0
+	acc := bytes("")
+	guard := 0
+	for got < plen { guard = guard + 1
+		if guard > nblocks * 64 + 256 { return data, outbuf, ok }
+		f := peer_msg(fd, outbuf)
+		outbuf = f.buf
+		if f.ok == 0 { return data, outbuf, ok }
+		if f.id == 7 { pidx := rd32(f.payload, 0)
+			begin := rd32(f.payload, 4)
+			block := bytes_sub(f.payload, 8, len(f.payload))
+			if pidx == idx { if begin == len(acc) { acc = bytes_concat(acc, block)  got = len(acc) } } }
+		if f.id == 0 { return data, outbuf, ok } }
+	data = acc
+	ok = 1 }

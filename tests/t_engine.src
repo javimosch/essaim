@@ -1,0 +1,75 @@
+var g_fail = 0
+
+func expect(name, got, want) { if got == want { println("ok   " + name)  return }
+	println("FAIL " + name + "\n  got  " + got + "\n  want " + want)
+	g_fail = g_fail + 1 }
+
+var DATA = "ABCDEFGHIJKLMNO"
+
+// A real seeder, small enough to read: it speaks the actual peer wire protocol
+// (handshake, bitfield, unchoke, request -> piece), so the engine is exercised
+// against the protocol rather than against a mock of itself.
+func fake_seed(srv, infohash, npieces, plen) { fd := accept(srv)
+	if fd < 0 { return }
+	socket_timeout(fd, 5000)
+	buf, ok := fill(fd, bytes(""), 68)
+	if ok == 0 { close(fd)  return }
+	pid := to_hex(rand_bytes(20))
+	write_bytes(fd, from_hex("13" + to_hex(bytes("BitTorrent protocol")) + "0000000000000000" + infohash + pid))
+	buf = bytes_sub(buf, 68, len(buf))
+	// bitfield: every piece present
+	nb := (npieces + 7) / 8
+	bits := ""
+	i := 0
+	for i < nb { bits = bits + "ff"  i = i + 1 }
+	write_bytes(fd, from_hex(be32_hex(1 + nb) + "05" + bits))
+	write_bytes(fd, msg_simple(1))
+	for 1 == 1 { f := peer_msg(fd, buf)
+		buf = f.buf
+		if f.ok == 0 { close(fd)  return }
+		if f.id == 6 { idx := rd32(f.payload, 0)
+			begin := rd32(f.payload, 4)
+			length := rd32(f.payload, 8)
+			off := idx * plen + begin
+			blk := bytes_sub(bytes(DATA), off, off + length)
+			write_bytes(fd, bytes_concat(from_hex(be32_hex(9 + length) + "07" + be32_hex(idx) + be32_hex(begin)), blk)) } } }
+
+func mk_torrent(infohash) (t) { f := TFile{path: "out.bin", length: 15, offset: 0}
+	hashes := ""
+	i := 0
+	for i < 3 { lo := i * 6
+		hi := lo + 6
+		if hi > 15 { hi = 15 }
+		hashes = hashes + to_hex(sha1_bytes(bytes_sub(bytes(DATA), lo, hi)))
+		i = i + 1 }
+	t = Torrent{name: "out.bin", infohash: infohash, piecelen: 6, total: 15, npieces: 3, pieces: hashes, files: []TFile{f}, announce: []string{}, ok: 1} }
+
+func main() { dir := "/tmp/essaim-engine-test"
+	system("rm -rf " + dir)
+	ih := "0123456789abcdef0123456789abcdef01234567"
+	t := mk_torrent(ih)
+	expect("hash-len", str(len(t.pieces)), "120")
+	srv := listen(19871)
+	if srv < 0 { println("FAIL cannot bind 19871")  exit(1) }
+	go fake_seed(srv, ih, 3, 6)
+	peers := []Peer{Peer{ip: "127.0.0.1", port: 19871}}
+	s := engine_download(t, dir, peers, peer_id_new(), 5000, 20000, 0)
+	expect("complete", str(s.complete), "1")
+	expect("done", str(s.done), "3")
+	expect("bytes", str(s.bytes), "15")
+	expect("peers-ok", str(s.peers_ok), "1")
+	expect("content", read_file(dir + "/out.bin"), DATA)
+	expect("size", str(file_size(dir + "/out.bin")), "15")
+	// resume: a second run must verify what is on disk and download NOTHING
+	s2 := engine_download(t, dir, []Peer{}, peer_id_new(), 5000, 20000, 0)
+	expect("resume-complete", str(s2.complete), "1")
+	expect("resume-done", str(s2.done), "3")
+	expect("resume-nopeers", str(s2.peers_ok), "0")
+	// a corrupted file must be DETECTED, not resumed as done
+	write_file_at(dir + "/out.bin", 7, bytes("X"))
+	s3 := engine_download(t, dir, []Peer{}, peer_id_new(), 5000, 500, 0)
+	expect("corrupt-detected", str(s3.done), "2")
+	expect("corrupt-incomplete", str(s3.complete), "0")
+	system("rm -rf " + dir)
+	if g_fail == 0 { println("\nALL PASS") }
+	if g_fail > 0 { println("\n" + str(g_fail) + " FAILED")  exit(1) } }

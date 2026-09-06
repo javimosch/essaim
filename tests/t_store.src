@@ -1,0 +1,34 @@
+var g_fail = 0
+
+func expect(name, got, want) { if got == want { println("ok   " + name)  return }
+	println("FAIL " + name + "\n  got  " + got + "\n  want " + want)
+	g_fail = g_fail + 1 }
+
+// Two files of 10 and 5 bytes, pieces of 6 -> piece 1 STRADDLES the boundary
+// (bytes 6..11 spans file a at 6..9 and file b at 0..1). That straddle is the
+// whole reason this layer exists.
+func mk() (t) { f1 := TFile{path: "a.bin", length: 10, offset: 0}
+	f2 := TFile{path: "sub/b.bin", length: 5, offset: 10}
+	t = Torrent{name: "d", piecelen: 6, total: 15, npieces: 3, files: []TFile{f1, f2}, announce: []string{}, ok: 1} }
+
+func main() { dir := "/tmp/essaim-store-test"
+	system("rm -rf " + dir)
+	t := mk()
+	expect("psize0", str(piece_size(t, 0)), "6")
+	expect("psize2", str(piece_size(t, 2)), "3")
+	// write the pieces OUT OF ORDER, which is the real access pattern
+	expect("w2", str(store_write_piece(t, dir, 2, bytes("MNO"))), "3")
+	expect("w0", str(store_write_piece(t, dir, 0, bytes("ABCDEF"))), "6")
+	expect("w1", str(store_write_piece(t, dir, 1, bytes("GHIJKL"))), "6")
+	expect("file-a", read_file(dir + "/a.bin"), "ABCDEFGHIJ")
+	expect("file-b", read_file(dir + "/sub/b.bin"), "KLMNO")
+	expect("size-a", str(file_size(dir + "/a.bin")), "10")
+	expect("size-b", str(file_size(dir + "/sub/b.bin")), "5")
+	// and reading a straddling piece back must reassemble across the boundary
+	expect("read1", bytes_str(store_read_piece(t, dir, 1)), "GHIJKL")
+	expect("read0", bytes_str(store_read_piece(t, dir, 0)), "ABCDEF")
+	expect("read2", bytes_str(store_read_piece(t, dir, 2)), "MNO")
+	expect("mkdir-nested", str(is_dir(dir + "/sub")), "true")
+	system("rm -rf " + dir)
+	if g_fail == 0 { println("\nALL PASS") }
+	if g_fail > 0 { println("\n" + str(g_fail) + " FAILED")  exit(1) } }

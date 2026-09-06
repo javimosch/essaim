@@ -1,0 +1,50 @@
+// The output contract (cli-output-spec).
+//
+// stdout carries DATA and nothing else -- one JSON object per invocation, so an
+// agent that pipes stdout to a parser never has to strip a progress line out of
+// it. stderr carries context: progress, warnings, the disclosure telemetry owes
+// the user. The two never mix.
+//
+// Exit codes are semantic (0, then 80-119 by category) and MUST equal the
+// error.code in the body, so an agent can branch on $? alone.
+
+var EXIT_OK = 0
+var EXIT_ARGS = 80
+var EXIT_VALIDATION = 82
+var EXIT_VALUE = 85
+var EXIT_NOTFOUND = 92
+var EXIT_CONFLICT = 95
+var EXIT_NETWORK = 100
+var EXIT_EXTERNAL = 105
+var EXIT_INTERNAL = 110
+
+var VERSION = "0.1.0"
+
+// eprint is the only way context reaches the user. Never println() a diagnostic.
+func eprint(s) { write(2, s + "\n") }
+
+// emit prints a success envelope and exits 0. `data` is a JSON fragment that
+// becomes the body's payload, so callers build it with json() of a struct.
+func emit(data) { println("{\"ok\":true,\"version\":\"" + VERSION + "\",\"data\":" + data + "}")
+	flush()
+	exit(EXIT_OK) }
+
+// fail prints a typed error and exits with the SAME code that appears in it.
+// recoverable is true only for the transient 100-109 band, which is the signal
+// an agent uses to decide whether retrying could possibly help.
+func fail(code, etype, message, suggestions) { rec := "false"
+	if code >= 100 { if code <= 109 { rec = "true" } }
+	sug := "[]"
+	if len(suggestions) > 0 { parts := []string{}
+		i := 0
+		for i < len(suggestions) { parts = append(parts, "\"" + jesc(suggestions[i]) + "\"")  i = i + 1 }
+		sug = "[" + join(parts, ",") + "]" }
+	println("{\"ok\":false,\"version\":\"" + VERSION + "\",\"error\":{\"code\":" + str(code) + ",\"type\":\"" + etype + "\",\"message\":\"" + jesc(message) + "\",\"recoverable\":" + rec + ",\"suggestions\":" + sug + "}}")
+	flush()
+	exit(code) }
+
+func jesc(s) (out) { out = replace(s, "\\", "\\\\")
+	out = replace(out, "\"", "\\\"")
+	out = replace(out, "\n", "\\n")
+	out = replace(out, "\r", "\\r")
+	out = replace(out, "\t", "\\t") }

@@ -1,0 +1,79 @@
+// The piece store: where a verified piece actually lands on disk.
+//
+// A torrent is one contiguous byte stream that happens to be cut into files. A
+// piece is a range of that stream and can straddle a file boundary, so writing
+// one means splitting it across however many files it touches and writing each
+// fragment at its own offset. That is what write_file_at is for -- pieces arrive
+// from the swarm in no useful order, and buffering the whole torrent in RAM to
+// avoid seeking is not an option.
+
+// store_write_piece splits a piece across the files it covers and writes each
+// fragment. Returns the number of bytes written, -1 on any failure.
+func store_write_piece(t, dir, idx, data) (n) { n = 0
+	start := idx * t.piecelen
+	stop := start + len(data)
+	i := 0
+	for i < len(t.files) { f := t.files[i]
+		fstart := f.offset
+		fstop := f.offset + f.length
+		lo := start
+		if fstart > lo { lo = fstart }
+		hi := stop
+		if fstop < hi { hi = fstop }
+		if lo < hi { path := dir + "/" + f.path
+			if mkdir_p(parent_dir(path)) == 0 { n = -1  return n }
+			w := write_file_at(path, lo - fstart, bytes_sub(data, lo - start, hi - start))
+			if w < 0 { n = -1  return n }
+			n = n + w }
+		i = i + 1 } }
+
+// store_read_piece reads a piece back off disk, reassembling it across files.
+// Used to re-verify on resume: essaim keeps no separate progress journal, the
+// files themselves are the state, so a restart re-checks what is already there.
+func store_read_piece(t, dir, idx) (data) { data = bytes("")
+	start := idx * t.piecelen
+	stop := start + piece_size(t, idx)
+	i := 0
+	for i < len(t.files) { f := t.files[i]
+		lo := start
+		if f.offset > lo { lo = f.offset }
+		hi := stop
+		if f.offset + f.length < hi { hi = f.offset + f.length }
+		if lo < hi { whole := read_file_bytes(dir + "/" + f.path)
+			a := lo - f.offset
+			b := hi - f.offset
+			if b > len(whole) { data = bytes("")  return data }
+			data = bytes_concat(data, bytes_sub(whole, a, b)) }
+		i = i + 1 } }
+
+// piece_ok is the only thing that decides a piece is real: its SHA-1 must match
+// the hash the torrent committed to. A peer can send anything.
+func piece_ok(t, idx, data) (ok) { ok = 0
+	if len(data) != piece_size(t, idx) { return ok }
+	if to_hex(sha1_bytes(data)) == piece_hash(t, idx) { ok = 1 } }
+
+// store_scan re-verifies everything on disk and returns the have-set, so an
+// interrupted download resumes instead of restarting.
+func store_scan(t, dir) (have) { have = []int{}
+	i := 0
+	for i < t.npieces { h := 0
+		d := store_read_piece(t, dir, i)
+		if len(d) > 0 { if piece_ok(t, i, d) == 1 { h = 1 } }
+		have = append(have, h)
+		i = i + 1 } }
+
+func parent_dir(p) (d) { d = ""
+	i := len(p) - 1
+	for i >= 0 { if charat(p, i) == "/" { d = substr(p, 0, i)  return d }  i = i - 1 } }
+
+// mkdir_p creates every missing component. machin's mkdir is one level only.
+func mkdir_p(p) (ok) { ok = 1
+	if p == "" { return ok }
+	parts := split(p, "/")
+	cur := ""
+	if has_prefix(p, "/") { cur = "" }
+	i := 0
+	for i < len(parts) { if parts[i] != "" { cur = cur + "/" + parts[i]
+			if is_dir(cur) == false { mkdir(cur) } }
+		i = i + 1 }
+	if is_dir(p) == false { ok = 0 } }

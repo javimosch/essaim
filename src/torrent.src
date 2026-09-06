@@ -1,0 +1,154 @@
+// .torrent and magnet parsing -> the Torrent value the engine downloads.
+//
+// The infohash is SHA-1 over the raw `info` dict bytes (BEP 3). It is the
+// identity of a swarm: trackers key on it, peers handshake with it, and a
+// magnet link is little more than that hash plus hints.
+
+type TFile struct { path string  length int  offset int }
+
+type Torrent struct { infohash string  name string  piecelen int  total int  npieces int  pieces string  announce []string  files []TFile  ok int  err string }
+
+// jraw pulls a path out of the bencode-JSON, stripping the quotes json_get
+// leaves on a string token. machin's json_get paths are LEADING-DOT (".a.b"):
+// a bare "a.b" reports err="path", so the dot is added here once rather than at
+// every call site.
+func jraw(j, path) (out) { out = ""
+	v, e := json_get(j, "." + path)
+	if e != "" { return out }
+	if len(v) >= 2 { if charat(v, 0) == "\"" { out = substr(v, 1, len(v) - 1)  return out } }
+	out = v }
+
+// jtext decodes a hex-encoded bencode string back to text.
+func jtext(j, path) (out) { out = bytes_str(from_hex(jraw(j, path))) }
+
+func jint(j, path) (out) { out = parse_int(jraw(j, path)) }
+
+// torrent_parse turns the bytes of a .torrent file into a Torrent.
+func torrent_parse(raw) (t) { t = Torrent{ok: 0, announce: []string{}, files: []TFile{}}
+	j := ben_json(raw)
+	if j == "" { t.err = "not bencode"  return t }
+	istart, istop := ben_span(raw, "info")
+	if istart < 0 { t.err = "no info dict"  return t }
+	t.infohash = to_hex(sha1_bytes(bytes_sub(raw, istart, istop)))
+	t.name = jtext(j, "info.name")
+	t.piecelen = jint(j, "info.piece length")
+	t.pieces = jraw(j, "info.pieces")
+	if t.piecelen <= 0 { t.err = "bad piece length"  return t }
+	if len(t.pieces) == 0 { t.err = "no piece hashes"  return t }
+	// pieces is a hex rendering of 20-byte SHA-1s, so 40 hex chars per piece
+	t.npieces = len(t.pieces) / 40
+	t.announce = torrent_trackers(j)
+	t.files = torrent_files(j, t.name)
+	i := 0
+	for i < len(t.files) { t.total = t.total + t.files[i].length  i = i + 1 }
+	if t.total == 0 { t.err = "empty torrent"  return t }
+	t.ok = 1 }
+
+// A torrent is either single-file (info.length) or multi-file (info.files, each
+// with a path as a LIST of components). Both collapse to a flat file table with
+// running offsets, which is the only shape the piece writer cares about.
+func torrent_files(j, name) (out) { out = []TFile{}
+	single := jraw(j, "info.length")
+	if single != "" { f := TFile{path: name, length: parse_int(single), offset: 0}
+		out = append(out, f)
+		return out }
+	off := 0
+	i := 0
+	for i < 64000 { lp := "info.files[" + str(i) + "].length"
+		lv := jraw(j, lp)
+		if lv == "" { break }
+		parts := []string{}
+		k := 0
+		for k < 64 { pv := jraw(j, "info.files[" + str(i) + "].path[" + str(k) + "]")
+			if pv == "" { break }
+			parts = append(parts, bytes_str(from_hex(pv)))
+			k = k + 1 }
+		fpath := join(parts, "/")
+		if fpath == "" { fpath = "file" + str(i) }
+		f := TFile{path: fpath, length: parse_int(lv), offset: off}
+		out = append(out, f)
+		off = off + f.length
+		i = i + 1 } }
+
+// Trackers come from `announce` plus the `announce-list` tiers (BEP 12). Order
+// is preserved and duplicates dropped: the engine tries them in sequence.
+func torrent_trackers(j) (out) { out = []string{}
+	a := jraw(j, "announce")
+	if a != "" { out = append(out, bytes_str(from_hex(a))) }
+	i := 0
+	for i < 64 { k := 0
+		hit := 0
+		for k < 64 { v := jraw(j, "announce-list[" + str(i) + "][" + str(k) + "]")
+			if v == "" { break }
+			hit = 1
+			u := bytes_str(from_hex(v))
+			if tracker_seen(out, u) == 0 { out = append(out, u) }
+			k = k + 1 }
+		if hit == 0 { break }
+		i = i + 1 } }
+
+func tracker_seen(list, u) (seen) { seen = 0
+	i := 0
+	for i < len(list) { if list[i] == u { seen = 1  return seen }  i = i + 1 } }
+
+// piece_hash returns the expected SHA-1 (hex) of piece idx.
+func piece_hash(t, idx) (h) { h = ""
+	if idx < 0 { return h }
+	if idx >= t.npieces { return h }
+	h = substr(t.pieces, idx * 40, idx * 40 + 40) }
+
+// piece_size is the piece length, except the last piece which is a remainder.
+func piece_size(t, idx) (n) { n = t.piecelen
+	if idx == t.npieces - 1 { n = t.total - t.piecelen * idx } }
+
+// magnet_parse reads magnet:?xt=urn:btih:<hash>&dn=<name>&tr=<tracker>...
+// A magnet carries no piece hashes -- those arrive from a peer via the metadata
+// exchange -- so the Torrent it yields is a STUB: infohash, maybe a name, maybe
+// trackers, and npieces 0.
+func magnet_parse(uri) (t) { t = Torrent{ok: 0, announce: []string{}, files: []TFile{}}
+	if has_prefix(uri, "magnet:?") == false { t.err = "not a magnet uri"  return t }
+	q := substr(uri, 8, len(uri))
+	parts := split(q, "&")
+	i := 0
+	for i < len(parts) { kv := parts[i]
+		eq := index(kv, "=")
+		if eq > 0 { k := substr(kv, 0, eq)
+			v := url_decode(substr(kv, eq + 1, len(kv)))
+			if k == "xt" { t.infohash = magnet_btih(v) }
+			if k == "dn" { t.name = v }
+			if k == "tr" { if tracker_seen(t.announce, v) == 0 { t.announce = append(t.announce, v) } } }
+		i = i + 1 }
+	if len(t.infohash) != 40 { t.err = "no btih infohash"  return t }
+	t.ok = 1 }
+
+// xt=urn:btih:<40 hex> (BEP 9) or the base32 form some sites still emit.
+func magnet_btih(v) (h) { h = ""
+	if has_prefix(v, "urn:btih:") == false { return h }
+	raw := substr(v, 9, len(v))
+	if len(raw) == 40 { h = to_lower(raw)  return h }
+	if len(raw) == 32 { h = base32_hex(raw) } }
+
+// base32 -> hex, for the older 32-char magnet form.
+func base32_hex(s) (out) { out = ""
+	alpha := "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+	acc := 0
+	nbits := 0
+	i := 0
+	u := to_upper(s)
+	for i < len(u) { c := charat(u, i)
+		v := index(alpha, c)
+		if v < 0 { out = ""  return out }
+		acc = acc * 32 + v
+		nbits = nbits + 5
+		if nbits >= 8 { nbits = nbits - 8
+			b := acc / pow2(nbits)
+			acc = acc - b * pow2(nbits)
+			out = out + hex_byte(b) }
+		i = i + 1 } }
+
+func pow2(n) (v) { v = 1
+	i := 0
+	for i < n { v = v * 2  i = i + 1 } }
+
+func hex_byte(b) (s) { d := "0123456789abcdef"
+	s = charat(d, b / 16) + charat(d, b - (b / 16) * 16) }

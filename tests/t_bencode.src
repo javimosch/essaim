@@ -1,0 +1,32 @@
+func expect(name, got, want) { if got == want { println("ok   " + name)  return }
+	println("FAIL " + name + "\n  got  " + got + "\n  want " + want)
+	g_fail = g_fail + 1 }
+
+var g_fail = 0
+
+func main() { expect("int", ben_json(bytes("i42e")), "42")
+	expect("negint", ben_json(bytes("i-7e")), "-7")
+	expect("str", ben_json(bytes("4:spam")), "\"7370616d\"")
+	expect("empty-str", ben_json(bytes("0:")), "\"\"")
+	expect("list", ben_json(bytes("li1ei2ee")), "[1,2]")
+	expect("dict", ben_json(bytes("d3:cow3:moo4:spam4:eggse")), "{\"cow\":\"6d6f6f\",\"spam\":\"65676773\"}")
+	expect("nested", ben_json(bytes("d4:infod6:lengthi12eee")), "{\"info\":{\"length\":12}}")
+	expect("empty-list", ben_json(bytes("le")), "[]")
+	expect("empty-dict", ben_json(bytes("de")), "{}")
+	// a byte string full of NULs and quotes survives, because values are hex
+	raw := bytes_concat(bytes("6:"), from_hex("002200ff0041"))
+	expect("binary-str", ben_json(raw), "\"002200ff0041\"")
+	// truncation is an error, not a partial parse
+	expect("truncated", ben_json(bytes("d3:cow")), "")
+	expect("bad-len", ben_json(bytes("9:ab")), "")
+	expect("garbage", ben_json(bytes("x")), "")
+	// ben_span reports the RAW byte range so the infohash hashes the original bytes
+	doc := bytes("d8:announce3:url4:infod6:lengthi12eee")
+	s, e := ben_span(doc, "info")
+	expect("span-info", bytes_str(bytes_sub(doc, s, e)), "d6:lengthi12ee")
+	s2, e2 := ben_span(doc, "announce")
+	expect("span-announce", bytes_str(bytes_sub(doc, s2, e2)), "3:url")
+	s3, _ := ben_span(doc, "nope")
+	expect("span-missing", str(s3), "-1")
+	if g_fail == 0 { println("\nALL PASS") }
+	if g_fail > 0 { println("\n" + str(g_fail) + " FAILED")  exit(1) } }

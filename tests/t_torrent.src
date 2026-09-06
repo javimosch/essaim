@@ -1,0 +1,67 @@
+var g_fail = 0
+
+func expect(name, got, want) { if got == want { println("ok   " + name)  return }
+	println("FAIL " + name + "\n  got  " + got + "\n  want " + want)
+	g_fail = g_fail + 1 }
+
+// A minimal single-file torrent, built by hand so the expected infohash is
+// computable independently (sha1 of the raw info dict bytes).
+func single_torrent() (b) { info := "d6:lengthi30e4:name8:test.bin12:piece lengthi16e6:pieces40:"
+	hashes := ""
+	i := 0
+	for i < 40 { hashes = hashes + "A"  i = i + 1 }
+	b = bytes("d8:announce31:http://tracker.example/announce4:info" + info + hashes + "ee") }
+
+func main() { raw := single_torrent()
+	t := torrent_parse(raw)
+	expect("ok", str(t.ok), "1")
+	expect("name", t.name, "test.bin")
+	expect("piecelen", str(t.piecelen), "16")
+	expect("total", str(t.total), "30")
+	expect("npieces", str(t.npieces), "2")
+	expect("nfiles", str(len(t.files)), "1")
+	if len(t.files) > 0 { expect("file-path", t.files[0].path, "test.bin") }
+	if len(t.announce) > 0 { expect("tracker", t.announce[0], "http://tracker.example/announce") }
+	// the infohash must be sha1 over the RAW info-dict bytes, not a re-encoding
+	s, e := ben_span(raw, "info")
+	expect("infohash", t.infohash, to_hex(sha1_bytes(bytes_sub(raw, s, e))))
+	expect("infohash-len", str(len(t.infohash)), "40")
+	// last piece is a remainder, not a full piece
+	expect("piece0-size", str(piece_size(t, 0)), "16")
+	expect("piece1-size", str(piece_size(t, 1)), "14")
+	expect("piece-hash-len", str(len(piece_hash(t, 0))), "40")
+	expect("piece-hash-oob", piece_hash(t, 9), "")
+	// a corrupt document is rejected, not half-accepted
+	bad := torrent_parse(bytes("not bencode at all"))
+	expect("bad-ok", str(bad.ok), "0")
+	noinfo := torrent_parse(bytes("d8:announce3:urle"))
+	expect("noinfo-err", noinfo.err, "no info dict")
+	// magnets
+	m := magnet_parse("magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&dn=Thing&tr=udp%3A%2F%2Ftr.example%3A80")
+	expect("magnet-ok", str(m.ok), "1")
+	expect("magnet-hash", m.infohash, "0123456789abcdef0123456789abcdef01234567")
+	expect("magnet-name", m.name, "Thing")
+	if len(m.announce) > 0 { expect("magnet-tracker", m.announce[0], "udp://tr.example:80") }
+	expect("magnet-nopieces", str(m.npieces), "0")
+	up := magnet_parse("magnet:?xt=urn:btih:0123456789ABCDEF0123456789ABCDEF01234567")
+	expect("magnet-uppercase", up.infohash, "0123456789abcdef0123456789abcdef01234567")
+	bm := magnet_parse("http://example.com")
+	expect("magnet-reject", bm.err, "not a magnet uri")
+	nm := magnet_parse("magnet:?dn=x")
+	expect("magnet-nohash", nm.err, "no btih infohash")
+	// a multi-file torrent flattens to a file table with running offsets
+	mf := "d5:filesld6:lengthi10e4:pathl1:a5:x.txteed6:lengthi5e4:pathl5:y.bineee4:name3:dir12:piece lengthi16e6:pieces20:"
+	h20 := ""
+	k := 0
+	for k < 20 { h20 = h20 + "B"  k = k + 1 }
+	mt := torrent_parse(bytes("d4:info" + mf + h20 + "ee"))
+	expect("mf-ok", str(mt.ok), "1")
+	expect("mf-nfiles", str(len(mt.files)), "2")
+	expect("mf-total", str(mt.total), "15")
+	if len(mt.files) > 1 { expect("mf-path0", mt.files[0].path, "a/x.txt")
+		expect("mf-off0", str(mt.files[0].offset), "0")
+		expect("mf-path1", mt.files[1].path, "y.bin")
+		expect("mf-off1", str(mt.files[1].offset), "10") }
+	expect("mf-npieces", str(mt.npieces), "1")
+	if g_fail == 0 { println("\nALL PASS") }
+	if g_fail > 0 { println("\n" + str(g_fail) + " FAILED")  exit(1) } }

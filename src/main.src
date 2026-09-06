@@ -1,0 +1,116 @@
+// The command surface. Every command prints one JSON object on stdout and
+// exits with a semantic code; progress and diagnostics go to stderr only.
+
+func arg_at(a, i) (v) { v = ""
+	if i < len(a) { v = a[i] } }
+
+// flag_val reads "--name value"; flag_on reports a bare "--name". Args are
+// parsed by hand rather than through a builder so that a missing value is a
+// typed error instead of a silent default.
+func flag_val(a, name, dflt) (v) { v = dflt
+	i := 0
+	for i < len(a) { if a[i] == name { if i + 1 < len(a) { v = a[i + 1] }  return v }
+		i = i + 1 } }
+
+func flag_on(a, name) (on) { on = 0
+	i := 0
+	for i < len(a) { if a[i] == name { on = 1  return on }  i = i + 1 } }
+
+func main() { a := args()
+	cmd := arg_at(a, 1)
+	if cmd == "" { cmd = "help-json" }
+	if cmd == "version" { emit("{\"version\":\"" + VERSION + "\"}") }
+	if cmd == "guide" { cmd_guide(a) }
+	if cmd == "help-json" { cmd_help_json() }
+	if cmd == "info" { cmd_info(a) }
+	if cmd == "get" { cmd_get(a) }
+	fail(EXIT_ARGS, "unknown_command", "no such command: " + cmd, []string{"essaim help-json", "essaim guide"}) }
+
+// source_bytes resolves a torrent argument to the raw bytes of a .torrent.
+// A magnet is accepted by the parser but cannot be downloaded yet: its metadata
+// lives in the swarm (BEP 9), so it is refused with a precise reason rather
+// than a generic failure.
+func source_bytes(src) (raw, err) { raw = bytes("")  err = ""
+	if has_prefix(src, "magnet:") { err = "magnet"  return raw, err }
+	if has_prefix(src, "http://") { raw, err = fetch_torrent(src)  return raw, err }
+	if has_prefix(src, "https://") { raw, err = fetch_torrent(src)  return raw, err }
+	raw = read_file_bytes(src)
+	if len(raw) == 0 { err = "notfound" } }
+
+func fetch_torrent(url) (raw, err) { raw = bytes("")  err = ""
+	status, body, e := http_get_b(url, 20000)
+	if e != "" { err = "network:" + e  return raw, err }
+	if status != 200 { err = "http:" + str(status)  return raw, err }
+	raw = body }
+
+func cmd_info(a) { src := arg_at(a, 2)
+	if src == "" { fail(EXIT_ARGS, "missing_argument", "info needs a .torrent path, url, or magnet", []string{"essaim info ./file.torrent"}) }
+	if has_prefix(src, "magnet:") { m := magnet_parse(src)
+		if m.ok == 0 { fail(EXIT_VALUE, "bad_magnet", m.err, []string{"check the xt=urn:btih: parameter"}) }
+		emit("{\"kind\":\"magnet\",\"infohash\":\"" + m.infohash + "\",\"name\":\"" + jesc(m.name) + "\",\"trackers\":" + str_list(m.announce) + ",\"has_metadata\":false}") }
+	raw, err := source_bytes(src)
+	if err == "notfound" { fail(EXIT_NOTFOUND, "not_found", "cannot read " + src, []string{"check the path"}) }
+	if err != "" { fail(EXIT_NETWORK, "fetch_failed", "could not fetch " + src + ": " + err, []string{"retry", "download the .torrent manually"}) }
+	t := torrent_parse(raw)
+	if t.ok == 0 { fail(EXIT_VALUE, "bad_torrent", t.err, []string{"the file may be html, not a .torrent"}) }
+	emit(torrent_json(t)) }
+
+func torrent_json(t) (j) { fj := []string{}
+	i := 0
+	for i < len(t.files) { fj = append(fj, "{\"path\":\"" + jesc(t.files[i].path) + "\",\"length\":" + str(t.files[i].length) + ",\"offset\":" + str(t.files[i].offset) + "}")
+		i = i + 1 }
+	j = "{\"kind\":\"torrent\",\"infohash\":\"" + t.infohash + "\",\"name\":\"" + jesc(t.name) + "\",\"total_bytes\":" + str(t.total) + ",\"piece_length\":" + str(t.piecelen) + ",\"pieces\":" + str(t.npieces) + ",\"trackers\":" + str_list(t.announce) + ",\"files\":[" + join(fj, ",") + "]}" }
+
+func str_list(xs) (j) { parts := []string{}
+	i := 0
+	for i < len(xs) { parts = append(parts, "\"" + jesc(xs[i]) + "\"")  i = i + 1 }
+	j = "[" + join(parts, ",") + "]" }
+
+func cmd_get(a) { src := arg_at(a, 2)
+	if src == "" { fail(EXIT_ARGS, "missing_argument", "get needs a .torrent path, url, or magnet", []string{"essaim get ./file.torrent --dir ./downloads"}) }
+	dir := flag_val(a, "--dir", ".")
+	timeout := parse_int(flag_val(a, "--timeout", "15000"))
+	deadline := parse_int(flag_val(a, "--deadline", "600000"))
+	port := parse_int(flag_val(a, "--port", "6881"))
+	quiet := flag_on(a, "--quiet")
+	raw, err := source_bytes(src)
+	if err == "magnet" { fail(EXIT_VALIDATION, "magnet_unsupported", "magnets need the metadata exchange (BEP 9), which this build does not have yet; use a .torrent file", []string{"essaim get ./file.torrent"}) }
+	if err == "notfound" { fail(EXIT_NOTFOUND, "not_found", "cannot read " + src, []string{"check the path"}) }
+	if err != "" { fail(EXIT_NETWORK, "fetch_failed", "could not fetch " + src + ": " + err, []string{"retry"}) }
+	t := torrent_parse(raw)
+	if t.ok == 0 { fail(EXIT_VALUE, "bad_torrent", t.err, []string{"the file may be html, not a .torrent"}) }
+	if mkdir_p(dir) == 0 { fail(EXIT_VALUE, "bad_dir", "cannot create " + dir, []string{"pick a writable --dir"}) }
+	progress := 1
+	if quiet == 1 { progress = 0 }
+	if progress == 1 { eprint("essaim: " + t.name + " -- " + str(t.total) + " bytes in " + str(t.npieces) + " pieces") }
+	pid := peer_id_new()
+	peers := gather_peers(t, pid, port, timeout, progress)
+	if len(peers) == 0 { fail(EXIT_NETWORK, "no_peers", "no tracker returned a peer for " + t.infohash, []string{"retry -- swarms are intermittent", "check network reachability to udp trackers"}) }
+	if progress == 1 { eprint("essaim: " + str(len(peers)) + " peers, starting") }
+	s := engine_download(t, dir, peers, pid, timeout, deadline, progress)
+	body := "{\"infohash\":\"" + t.infohash + "\",\"name\":\"" + jesc(t.name) + "\",\"dir\":\"" + jesc(dir) + "\",\"complete\":" + boolstr(s.complete) + ",\"pieces_done\":" + str(s.done) + ",\"pieces_total\":" + str(s.total) + ",\"bytes\":" + str(s.bytes) + ",\"peers_used\":" + str(s.peers_ok) + ",\"peers_dead\":" + str(s.peers_dead) + ",\"elapsed_ms\":" + str(s.elapsed) + "}"
+	if s.complete == 0 { println("{\"ok\":false,\"version\":\"" + VERSION + "\",\"error\":{\"code\":105,\"type\":\"incomplete\",\"message\":\"stopped with " + str(s.done) + "/" + str(s.total) + " pieces\",\"recoverable\":true,\"suggestions\":[\"run the same command again -- verified pieces are kept and the download resumes\"]},\"data\":" + body + "}")
+		flush()
+		exit(EXIT_EXTERNAL) }
+	emit(body) }
+
+func boolstr(v) (s) { s = "false"
+	if v == 1 { s = "true" } }
+
+// gather_peers announces to each tracker in turn and pools the results. It stops
+// as soon as it has a workable swarm rather than announcing to every tracker,
+// since each dead one costs a full timeout.
+func gather_peers(t, pid, port, timeout, progress) (peers) { peers = []Peer{}
+	i := 0
+	for i < len(t.announce) { u := t.announce[i]
+		a := tracker_announce(u, t.infohash, pid, port, t.total, timeout)
+		if a.ok == 1 { j := 0
+			for j < len(a.peers) { if peer_new(peers, a.peers[j]) == 1 { peers = append(peers, a.peers[j]) }  j = j + 1 }
+			if progress == 1 { eprint("essaim: " + u + " -> " + str(len(a.peers)) + " peers (" + str(a.seeders) + " seeders)") } }
+		if a.ok == 0 { if progress == 1 { eprint("essaim: " + u + " -> " + a.err) } }
+		if len(peers) >= 40 { return peers }
+		i = i + 1 } }
+
+func peer_new(list, p) (isnew) { isnew = 1
+	i := 0
+	for i < len(list) { if list[i].ip == p.ip { if list[i].port == p.port { isnew = 0  return isnew } }  i = i + 1 } }

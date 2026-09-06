@@ -1,3 +1,4 @@
 essaim
 essaim.mfl
 *.o
+dist/

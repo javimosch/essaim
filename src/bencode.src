@@ -1,4 +1,5 @@
-// Bencode decoding. Everything a .torrent or a tracker reply is written in.
+// Bencode decoding. Everything a .torrent, a tracker reply, or a DHT message is
+// written in.
 //
 // The decoder renders a bencoded document as JSON so the rest of essaim can
 // navigate it with json_get/parse instead of carrying a bespoke node tree.
@@ -11,91 +12,100 @@
 // `info` dictionary exactly as they appeared on disk, so it cannot be recomputed
 // from a decoded copy -- re-encoding may not reproduce the original byte order.
 // The parser therefore reports byte ranges, not just values.
+//
+// The cursor is THREADED THROUGH every call rather than held in a global. It was
+// a global once, which read more cleanly and was a real data race the moment
+// metadata fetch started running on several goroutines at once -- machin's
+// --race-safe caught it. Two parsers on two goroutines would have silently
+// corrupted each other's position.
 
-// g_ben_pos is the cursor shared by the recursive descent below. Bencode is
-// parsed in one pass on one goroutine (at add-time), never concurrently.
-var g_ben_pos = 0
-var g_ben_err = 0
+// ben_json decodes a whole document. Returns "" if it is not valid bencode.
+func ben_json(src) (out) { out = ""
+	v, _, err := ben_value(src, 0)
+	if err == 0 { out = v } }
 
-func ben_json(src) (out) { g_ben_pos = 0  g_ben_err = 0
-	out = ben_value(src)
-	if g_ben_err == 1 { out = "" } }
+// ben_parse_end decodes ONE value and also reports where it ended. The BEP 9
+// data message is a bencode dict with the raw metadata bytes appended straight
+// after it, so the only way to find the payload is to know where the dict stops.
+func ben_parse_end(src) (out, endpos) { out = ""  endpos = 0
+	v, pos, err := ben_value(src, 0)
+	if err == 0 { out = v  endpos = pos } }
 
-func ben_ok() (ok) { ok = 0
-	if g_ben_err == 0 { ok = 1 } }
-
-// ben_value decodes one value at the cursor and returns its JSON rendering.
-func ben_value(src) (out) { out = "null"
-	if g_ben_err == 1 { return out }
-	if g_ben_pos >= len(src) { g_ben_err = 1  return out }
-	c := byte_at(src, g_ben_pos)
-	if c == 105 { out = ben_int(src)  return out }
-	if c == 108 { out = ben_list(src)  return out }
-	if c == 100 { out = ben_dict(src)  return out }
-	if c >= 48 { if c <= 57 { out = ben_str(src)  return out } }
-	g_ben_err = 1 }
+// ben_value decodes one value at `pos` -> (json, next position, err flag).
+func ben_value(src, pos) (out, npos, err) { out = "null"  npos = pos  err = 0
+	if pos >= len(src) { err = 1  return out, npos, err }
+	c := byte_at(src, pos)
+	if c == 105 { out, npos, err = ben_int(src, pos)  return out, npos, err }
+	if c == 108 { out, npos, err = ben_list(src, pos)  return out, npos, err }
+	if c == 100 { out, npos, err = ben_dict(src, pos)  return out, npos, err }
+	if c >= 48 { if c <= 57 { out, npos, err = ben_str(src, pos)  return out, npos, err } }
+	err = 1 }
 
 // i<digits>e -- a JSON number. Bencode integers are arbitrary precision in
 // theory; in practice they are file sizes and timestamps, so int64 is enough.
-func ben_int(src) (out) { out = "0"
-	g_ben_pos = g_ben_pos + 1
-	start := g_ben_pos
-	for g_ben_pos < len(src) { if byte_at(src, g_ben_pos) == 101 { break }  g_ben_pos = g_ben_pos + 1 }
-	if g_ben_pos >= len(src) { g_ben_err = 1  return out }
-	out = bytes_str(bytes_sub(src, start, g_ben_pos))
-	g_ben_pos = g_ben_pos + 1
-	if len(out) == 0 { g_ben_err = 1  out = "0" } }
+func ben_int(src, pos) (out, npos, err) { out = "0"  err = 0
+	p := pos + 1
+	start := p
+	for p < len(src) { if byte_at(src, p) == 101 { break }  p = p + 1 }
+	if p >= len(src) { err = 1  npos = p  return out, npos, err }
+	out = bytes_str(bytes_sub(src, start, p))
+	npos = p + 1
+	if len(out) == 0 { err = 1  out = "0" } }
 
 // <len>:<bytes> -- a JSON string holding the value's HEX.
-func ben_str(src) (out) { out = "\"\""
-	start, stop := ben_str_span(src)
-	if g_ben_err == 1 { return out }
+func ben_str(src, pos) (out, npos, err) { out = "\"\""
+	start, stop, npos, err := ben_str_span(src, pos)
+	if err == 1 { return out, npos, err }
 	out = "\"" + to_hex(bytes_sub(src, start, stop)) + "\"" }
 
 // ben_str_span consumes a byte string and reports its payload byte range.
-func ben_str_span(src) (start, stop) { start = 0  stop = 0
+func ben_str_span(src, pos) (start, stop, npos, err) { start = 0  stop = 0  err = 0
 	n := 0
 	seen := 0
-	for g_ben_pos < len(src) { c := byte_at(src, g_ben_pos)
+	p := pos
+	for p < len(src) { c := byte_at(src, p)
 		if c == 58 { break }
-		if c < 48 { g_ben_err = 1  return start, stop }
-		if c > 57 { g_ben_err = 1  return start, stop }
+		if c < 48 { err = 1  npos = p  return start, stop, npos, err }
+		if c > 57 { err = 1  npos = p  return start, stop, npos, err }
 		n = n * 10 + (c - 48)
 		seen = seen + 1
-		g_ben_pos = g_ben_pos + 1 }
-	if seen == 0 { g_ben_err = 1  return start, stop }
-	if g_ben_pos >= len(src) { g_ben_err = 1  return start, stop }
-	start = g_ben_pos + 1
+		p = p + 1 }
+	if seen == 0 { err = 1  npos = p  return start, stop, npos, err }
+	if p >= len(src) { err = 1  npos = p  return start, stop, npos, err }
+	start = p + 1
 	stop = start + n
-	if stop > len(src) { g_ben_err = 1  start = 0  stop = 0  return start, stop }
-	g_ben_pos = stop }
+	if stop > len(src) { err = 1  start = 0  stop = 0  npos = p  return start, stop, npos, err }
+	npos = stop }
 
-func ben_list(src) (out) { out = "[]"
-	g_ben_pos = g_ben_pos + 1
+func ben_list(src, pos) (out, npos, err) { out = "[]"  err = 0
+	p := pos + 1
 	parts := []string{}
-	for g_ben_pos < len(src) { if byte_at(src, g_ben_pos) == 101 { break }
-		v := ben_value(src)
-		if g_ben_err == 1 { return out }
+	for p < len(src) { if byte_at(src, p) == 101 { break }
+		v, np, e := ben_value(src, p)
+		if e == 1 { err = 1  npos = np  return out, npos, err }
+		p = np
 		parts = append(parts, v) }
-	if g_ben_pos >= len(src) { g_ben_err = 1  return out }
-	g_ben_pos = g_ben_pos + 1
+	if p >= len(src) { err = 1  npos = p  return out, npos, err }
+	npos = p + 1
 	out = "[" + join(parts, ",") + "]" }
 
 // A bencode dict key is a byte string, but in every real document it is ASCII
 // ("info", "announce", "piece length"), so keys render as TEXT while values
 // render as hex -- that is what makes the JSON navigable by json_get path.
-func ben_dict(src) (out) { out = "{}"
-	g_ben_pos = g_ben_pos + 1
+func ben_dict(src, pos) (out, npos, err) { out = "{}"  err = 0
+	p := pos + 1
 	parts := []string{}
-	for g_ben_pos < len(src) { if byte_at(src, g_ben_pos) == 101 { break }
-		ks, ke := ben_str_span(src)
-		if g_ben_err == 1 { return out }
+	for p < len(src) { if byte_at(src, p) == 101 { break }
+		ks, ke, np, e := ben_str_span(src, p)
+		if e == 1 { err = 1  npos = np  return out, npos, err }
+		p = np
 		k := bytes_str(bytes_sub(src, ks, ke))
-		v := ben_value(src)
-		if g_ben_err == 1 { return out }
+		v, np2, e2 := ben_value(src, p)
+		if e2 == 1 { err = 1  npos = np2  return out, npos, err }
+		p = np2
 		parts = append(parts, "\"" + json_escape(k) + "\":" + v) }
-	if g_ben_pos >= len(src) { g_ben_err = 1  return out }
-	g_ben_pos = g_ben_pos + 1
+	if p >= len(src) { err = 1  npos = p  return out, npos, err }
+	npos = p + 1
 	out = "{" + join(parts, ",") + "}" }
 
 func json_escape(s) (out) { out = replace(s, "\\", "\\\\")
@@ -107,24 +117,17 @@ func json_escape(s) (out) { out = replace(s, "\\", "\\\\")
 // ben_span finds a TOP-LEVEL dict key and reports the raw byte range of its
 // value. This is how the infohash gets computed: sha1_bytes over exactly the
 // bytes the `info` dict occupied in the file, re-encoding nothing.
-func ben_span(src, want) (start, stop) { start = -1  stop = -1
-	g_ben_pos = 0  g_ben_err = 0
+func ben_span(src, want) (start, stop) { start = 0 - 1  stop = 0 - 1
 	if len(src) == 0 { return start, stop }
 	if byte_at(src, 0) != 100 { return start, stop }
-	g_ben_pos = 1
-	for g_ben_pos < len(src) { if byte_at(src, g_ben_pos) == 101 { break }
-		ks, ke := ben_str_span(src)
-		if g_ben_err == 1 { start = -1  stop = -1  return start, stop }
+	p := 1
+	for p < len(src) { if byte_at(src, p) == 101 { break }
+		ks, ke, np, e := ben_str_span(src, p)
+		if e == 1 { start = 0 - 1  stop = 0 - 1  return start, stop }
+		p = np
 		k := bytes_str(bytes_sub(src, ks, ke))
-		vstart := g_ben_pos
-		ben_value(src)
-		if g_ben_err == 1 { start = -1  stop = -1  return start, stop }
-		if k == want { start = vstart  stop = g_ben_pos  return start, stop } } }
-
-// ben_parse_end decodes ONE value and also reports where it ended. The BEP 9
-// data message is a bencode dict with the raw metadata bytes appended straight
-// after it, so the only way to find the payload is to know where the dict stops.
-func ben_parse_end(src) (out, endpos) { g_ben_pos = 0  g_ben_err = 0
-	out = ben_value(src)
-	endpos = g_ben_pos
-	if g_ben_err == 1 { out = ""  endpos = 0 } }
+		vstart := p
+		_, np2, e2 := ben_value(src, p)
+		if e2 == 1 { start = 0 - 1  stop = 0 - 1  return start, stop }
+		p = np2
+		if k == want { start = vstart  stop = p  return start, stop } } }

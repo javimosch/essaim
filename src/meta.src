@@ -62,15 +62,40 @@ func meta_fetch(host, port, infohash, peerid, timeout) (info, err) { info = byte
 	if to_hex(sha1_bytes(acc)) != infohash { err = "metadata failed infohash check"  return info, err }
 	info = acc }
 
-// meta_from_swarm tries peers in turn until one hands over valid metadata, then
-// rebuilds a full .torrent document around it so the normal parser can be used.
+// meta_from_swarm asks many peers AT ONCE and takes the first valid answer.
+//
+// Serial was the obvious first cut and it is unusable in practice: most
+// addresses the DHT returns are stale or firewalled, each costs a full connect
+// timeout, and a lookup that found 60 peers got through 2 of them before the
+// deadline. Fanning out turns "one dead peer delays everything" into "one live
+// peer is enough".
+//
+// Workers report over a channel, never through shared memory -- a goroutine's
+// arena is reclaimed when it returns, so a string it left in a global would
+// dangle. The info dict travels as hex for the same reason bencode renders byte
+// strings that way: it is binary, and a channel of strings must not truncate it.
+type MetaRes struct { ok int  info string  err string  peer string }
+
+func meta_worker(host, port, infohash, peerid, timeout, out) { info, e := meta_fetch(host, port, infohash, peerid, timeout)
+	who := host + ":" + str(port)
+	if e != "" { out <- json(MetaRes{ok: 0, info: "", err: e, peer: who})  return }
+	out <- json(MetaRes{ok: 1, info: to_hex(info), err: "", peer: who}) }
+
 func meta_from_swarm(peers, infohash, peerid, timeout, progress) (raw, err) { raw = bytes("")  err = "no peers to ask"
+	n := len(peers)
+	if n == 0 { return raw, err }
+	if n > 24 { n = 24 }
+	out := make(chan string)
 	i := 0
-	for i < len(peers) { if i >= 12 { return raw, err }
-		info, e := meta_fetch(peers[i].ip, peers[i].port, infohash, peerid, timeout)
-		if e == "" { raw = bytes_concat(bytes_concat(bytes("d4:info"), info), bytes("e"))
+	for i < n { go meta_worker(peers[i].ip, peers[i].port, infohash, peerid, timeout, out)
+		i = i + 1 }
+	done := 0
+	for done < n { r := parse(<-out, MetaRes{})
+		done = done + 1
+		if r.ok == 1 { raw = bytes_concat(bytes_concat(bytes("d4:info"), from_hex(r.info)), bytes("e"))
 			err = ""
+			if progress == 1 { eprint("essaim: metadata from " + r.peer + " (" + str(done) + " of " + str(n) + " peers answered)") }
 			return raw, err }
-		if progress == 1 { eprint("essaim: metadata from " + peers[i].ip + ":" + str(peers[i].port) + " -> " + e) }
-		err = e
-		i = i + 1 } }
+		err = r.err
+		if progress == 1 { eprint("essaim: metadata from " + r.peer + " -> " + r.err) } }
+	err = "no peer served the metadata" }

@@ -26,11 +26,51 @@ func main() { a := args()
 	if cmd == "get" { cmd_get(a) }
 	if cmd == "search" { cmd_search(a) }
 	if cmd == "sources" { cmd_sources() }
+	if cmd == "peers" { cmd_peers(a) }
 	if cmd == "install" { cmd_install(a) }
 	if cmd == "uninstall" { cmd_uninstall(a) }
 	if cmd == "update" { cmd_update(a) }
 	if cmd == "feedback" { cmd_feedback(a) }
 	fail(EXIT_ARGS, "unknown_command", "no such command: " + cmd, []string{"essaim help-json", "essaim guide"}) }
+
+// cmd_peers answers "is this swarm alive?" without downloading a byte. It is
+// also the honest way to see the DHT working on its own: pass --no-trackers and
+// every address returned came from the DHT.
+func cmd_peers(a) { src := arg_at(a, 2)
+	if src == "" { fail(EXIT_ARGS, "missing_argument", "peers needs a magnet, infohash, or .torrent", []string{"essaim peers <40-hex-infohash>"}) }
+	timeout := parse_int(flag_val(a, "--timeout", "15000"))
+	port := parse_int(flag_val(a, "--port", "6881"))
+	quiet := flag_on(a, "--quiet")
+	progress := 1
+	if quiet == 1 { progress = 0 }
+	ih := ""
+	ann := []string{}
+	if len(src) == 40 { ih = to_lower(src) }
+	if has_prefix(src, "magnet:") { m := magnet_parse(src)
+		if m.ok == 0 { fail(EXIT_VALUE, "bad_magnet", m.err, []string{}) }
+		ih = m.infohash
+		ann = m.announce }
+	if ih == "" { raw, err := source_bytes(src)
+		if err != "" { fail(EXIT_NOTFOUND, "not_found", "cannot read " + src, []string{}) }
+		t := torrent_parse(raw)
+		if t.ok == 0 { fail(EXIT_VALUE, "bad_torrent", t.err, []string{}) }
+		ih = t.infohash
+		ann = t.announce }
+	pid := peer_id_new()
+	from_tr := []Peer{}
+	if flag_on(a, "--no-trackers") == 0 { from_tr = gather_peers(ann, ih, 1048576, pid, port, timeout, progress) }
+	from_dht := []Peer{}
+	dhterr := ""
+	if flag_on(a, "--no-dht") == 0 { from_dht, dhterr = dht_get_peers(ih, 50, 10, 3000, progress) }
+	all := []Peer{}
+	i := 0
+	for i < len(from_tr) { if peer_new(all, from_tr[i]) == 1 { all = append(all, from_tr[i]) }  i = i + 1 }
+	i = 0
+	for i < len(from_dht) { if peer_new(all, from_dht[i]) == 1 { all = append(all, from_dht[i]) }  i = i + 1 }
+	rows := []string{}
+	i = 0
+	for i < len(all) { rows = append(rows, "{\"ip\":\"" + all[i].ip + "\",\"port\":" + str(all[i].port) + "}")  i = i + 1 }
+	emit("{\"infohash\":\"" + ih + "\",\"peers\":" + str(len(all)) + ",\"from_trackers\":" + str(len(from_tr)) + ",\"from_dht\":" + str(len(from_dht)) + ",\"dht_error\":\"" + jesc(dhterr) + "\",\"addresses\":[" + join(rows, ",") + "]}") }
 
 func cmd_sources() { srcs := sources_default()
 	rows := []string{}
@@ -48,7 +88,7 @@ func cmd_search(a) { q := arg_at(a, 2)
 	quiet := flag_on(a, "--quiet")
 	progress := 1
 	if quiet == 1 { progress = 0 }
-	hits := search_all(sources_default(), q, cat, limit, timeout, progress)
+	hits := search_all(sources_selected(flag_val(a, "--source", env("ESSAIM_SOURCES"))), q, cat, limit, timeout, progress)
 	rows := []string{}
 	i := 0
 	for i < len(hits) { h := hits[i]
@@ -77,7 +117,14 @@ func cmd_info(a) { src := arg_at(a, 2)
 	if src == "" { fail(EXIT_ARGS, "missing_argument", "info needs a .torrent path, url, or magnet", []string{"essaim info ./file.torrent"}) }
 	if has_prefix(src, "magnet:") { m := magnet_parse(src)
 		if m.ok == 0 { fail(EXIT_VALUE, "bad_magnet", m.err, []string{"check the xt=urn:btih: parameter"}) }
-		emit("{\"kind\":\"magnet\",\"infohash\":\"" + m.infohash + "\",\"name\":\"" + jesc(m.name) + "\",\"trackers\":" + str_list(m.announce) + ",\"has_metadata\":false}") }
+		// --fetch resolves the metadata from the swarm so the file list can be
+		// inspected BEFORE committing to a download. No content is transferred:
+		// BEP 9 carries only the info dict.
+		if flag_on(a, "--fetch") == 1 { raw, _ := resolve_magnet(src, peer_id_new(), 6881, 15000, 1 - flag_on(a, "--quiet"), flag_on(a, "--no-dht"))
+			t := torrent_parse(raw)
+			if t.ok == 0 { fail(EXIT_EXTERNAL, "bad_metadata", "the swarm returned metadata that does not parse: " + t.err, []string{"retry -- another peer may serve it"}) }
+			emit(torrent_json(t)) }
+		emit("{\"kind\":\"magnet\",\"infohash\":\"" + m.infohash + "\",\"name\":\"" + jesc(m.name) + "\",\"trackers\":" + str_list(m.announce) + ",\"has_metadata\":false,\"hint\":\"add --fetch to pull the file list from the swarm\"}") }
 	raw, err := source_bytes(src)
 	if err == "notfound" { fail(EXIT_NOTFOUND, "not_found", "cannot read " + src, []string{"check the path"}) }
 	if err != "" { fail(EXIT_NETWORK, "fetch_failed", "could not fetch " + src + ": " + err, []string{"retry", "download the .torrent manually"}) }
@@ -109,7 +156,7 @@ func cmd_get(a) { src := arg_at(a, 2)
 	raw := bytes("")
 	err := ""
 	peers := []Peer{}
-	if has_prefix(src, "magnet:") { raw, peers = resolve_magnet(src, pid, port, timeout, progress) }
+	if has_prefix(src, "magnet:") { raw, peers = resolve_magnet(src, pid, port, timeout, progress, flag_on(a, "--no-dht")) }
 	if has_prefix(src, "magnet:") == false { raw, err = source_bytes(src) }
 	if err == "notfound" { fail(EXIT_NOTFOUND, "not_found", "cannot read " + src, []string{"check the path"}) }
 	if err != "" { fail(EXIT_NETWORK, "fetch_failed", "could not fetch " + src + ": " + err, []string{"retry"}) }
@@ -118,7 +165,11 @@ func cmd_get(a) { src := arg_at(a, 2)
 	if mkdir_p(dir) == 0 { fail(EXIT_VALUE, "bad_dir", "cannot create " + dir, []string{"pick a writable --dir"}) }
 	if progress == 1 { eprint("essaim: " + t.name + " -- " + str(t.total) + " bytes in " + str(t.npieces) + " pieces") }
 	if len(peers) == 0 { peers = gather_peers(t.announce, t.infohash, t.total, pid, port, timeout, progress) }
-	if len(peers) == 0 { fail(EXIT_NETWORK, "no_peers", "no tracker returned a peer for " + t.infohash, []string{"retry -- swarms are intermittent", "check network reachability to udp trackers"}) }
+	if flag_on(a, "--no-dht") == 0 { if len(peers) < 4 { dp, derr := dht_get_peers(t.infohash, 30, 8, 3000, progress)
+			if derr != "" { if progress == 1 { eprint("essaim: dht -> " + derr) } }
+			k := 0
+			for k < len(dp) { if peer_new(peers, dp[k]) == 1 { peers = append(peers, dp[k]) }  k = k + 1 } } }
+	if len(peers) == 0 { fail(EXIT_NETWORK, "no_peers", "neither the trackers nor the DHT returned a peer for " + t.infohash, []string{"retry -- swarms are intermittent", "check network reachability to udp trackers"}) }
 	if progress == 1 { eprint("essaim: " + str(len(peers)) + " peers, starting") }
 	s := engine_download(t, dir, peers, pid, timeout, deadline, progress)
 	body := "{\"infohash\":\"" + t.infohash + "\",\"name\":\"" + jesc(t.name) + "\",\"dir\":\"" + jesc(dir) + "\",\"complete\":" + boolstr(s.complete) + ",\"pieces_done\":" + str(s.done) + ",\"pieces_total\":" + str(s.total) + ",\"bytes\":" + str(s.bytes) + ",\"peers_used\":" + str(s.peers_ok) + ",\"peers_dead\":" + str(s.peers_dead) + ",\"elapsed_ms\":" + str(s.elapsed) + "}"
@@ -130,14 +181,19 @@ func cmd_get(a) { src := arg_at(a, 2)
 // resolve_magnet turns a magnet into a real .torrent document by asking the
 // swarm for its metadata (BEP 9). The peers found along the way are reused for
 // the download itself, so the tracker is not announced to twice.
-func resolve_magnet(src, pid, port, timeout, progress) (raw, peers) { raw = bytes("")  peers = []Peer{}
+func resolve_magnet(src, pid, port, timeout, progress, nodht) (raw, peers) { raw = bytes("")  peers = []Peer{}
 	m := magnet_parse(src)
 	if m.ok == 0 { fail(EXIT_VALUE, "bad_magnet", m.err, []string{"check the xt=urn:btih: parameter"}) }
-	if len(m.announce) == 0 { fail(EXIT_VALIDATION, "magnet_no_trackers", "this magnet lists no trackers and essaim has no DHT yet, so there is nowhere to find peers", []string{"use a magnet with &tr= trackers", "use a .torrent file instead"}) }
 	if progress == 1 { eprint("essaim: magnet " + m.infohash + " -- asking the swarm for metadata") }
 	peers = gather_peers(m.announce, m.infohash, 1048576, pid, port, timeout, progress)
-	if len(peers) == 0 { fail(EXIT_NETWORK, "no_peers", "no tracker returned a peer for " + m.infohash, []string{"retry -- swarms are intermittent"}) }
-	r, err := meta_from_swarm(peers, m.infohash, pid, timeout, progress)
+	// The DHT is what makes a trackerless magnet work at all, so it is tried
+	// whenever the trackers (if any) came up short, not only when there are none.
+	if nodht == 0 { if len(peers) < 4 { dp, derr := dht_get_peers(m.infohash, 30, 8, 3000, progress)
+			if derr != "" { if progress == 1 { eprint("essaim: dht -> " + derr) } }
+			k := 0
+			for k < len(dp) { if peer_new(peers, dp[k]) == 1 { peers = append(peers, dp[k]) }  k = k + 1 } } }
+	if len(peers) == 0 { fail(EXIT_NETWORK, "no_peers", "neither the trackers nor the DHT returned a peer for " + m.infohash, []string{"retry -- swarms and the DHT are both intermittent", "check that outbound UDP is not blocked"}) }
+	r, err := meta_from_swarm(peers, m.infohash, pid, 8000, progress)
 	if err != "" { fail(EXIT_EXTERNAL, "metadata_failed", "could not fetch metadata from any peer: " + err, []string{"retry -- another peer may serve it", "use a .torrent file instead"}) }
 	raw = r }
 
@@ -157,7 +213,3 @@ func gather_peers(announce, infohash, left, pid, port, timeout, progress) (peers
 		if a.ok == 0 { if progress == 1 { eprint("essaim: " + u + " -> " + a.err) } }
 		if len(peers) >= 40 { return peers }
 		i = i + 1 } }
-
-func peer_new(list, p) (isnew) { isnew = 1
-	i := 0
-	for i < len(list) { if list[i].ip == p.ip { if list[i].port == p.port { isnew = 0  return isnew } }  i = i + 1 } }

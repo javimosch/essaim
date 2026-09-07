@@ -7,9 +7,11 @@ protocol, trackers, BEP 9 metadata exchange and SHA-1 verification are all pure
 MFL. No libtorrent, no Node, no Python.
 
 ```sh
-essaim search "apollo 11 audio" --limit 10     # across five indexes at once
+essaim search "apollo 11 audio" --limit 10     # across the enabled indexes
+essaim peers  <infohash> --no-trackers         # who is in the swarm, via DHT only
 essaim info   ./file.torrent                   # read metadata, download nothing
 essaim get    ./file.torrent --dir ./dl        # or a magnet, or a https URL
+essaim info   "magnet:?xt=urn:btih:…" --fetch  # list the files, download nothing
 essaim guide                                   # the whole mental model, embedded
 ```
 
@@ -25,6 +27,7 @@ always equals `error.code` in the body.
 | **Trackers** | UDP (BEP 15) and HTTP (BEP 3) |
 | **Peers** | BEP 3 wire protocol, 16 KiB blocks pipelined per piece |
 | **Magnets** | BEP 9 metadata exchange over the BEP 10 extension protocol |
+| **DHT** | BEP 5 Kademlia — a bare magnet with no trackers works |
 | **Verification** | nothing is believed until a piece's SHA-1 matches the torrent's commitment |
 | **Resume** | no progress journal — the files on disk *are* the state |
 | **Search** | five indexes, each a declarative config row |
@@ -37,6 +40,8 @@ always equals `error.code` in the body.
   `diff -r` against the `.torrent` download: **no differences**
 - Full loop: `search` → 7.2 MB archive.org item → `get` → 14/14 pieces in 6.4 s
   → `unzip -t` reports no errors
+- **DHT**: 56 peers found for a busy swarm with trackers *fully disabled*, and a
+  bare trackerless magnet resolved its full 15-file listing via DHT → BEP 9
 - `machin build --race-safe` passes: the engine is **proved** data-race free
 
 ## Search sources
@@ -52,7 +57,14 @@ and exist as worked examples of the two supported response shapes — flip
 | source | kind | category | default |
 |---|---|---|---|
 | archive.org | JSON (`.torrent` links) | all | **enabled** |
-| others (5) | JSON / RSS examples | various | disabled |
+| others (6) | JSON / RSS examples | various | disabled |
+
+Enable a disabled row for one run without rebuilding:
+
+```sh
+essaim search "hitman" --cat games --source piratebay-games
+ESSAIM_SOURCES=all essaim search "…"
+```
 
 Two response shapes cover every index worth querying: a JSON API addressed by
 path templates (`{i}` = row index) and an RSS feed split on `<item>` and read
@@ -95,7 +107,7 @@ OpenSSL archives for musl.
 
 ```sh
 ./build.sh      # machin encode src/*.src > essaim.mfl && machin build essaim.mfl
-./tests/run.sh  # 181 assertions across 8 suites
+./tests/run.sh  # 228 assertions across 9 suites
 ```
 
 Tests need no network: the tracker suite stands up a fake BEP 15 tracker, the
@@ -104,9 +116,9 @@ index suite parses recorded response fixtures.
 
 ## Limits
 
-- **No DHT.** A magnet must list trackers (`&tr=`), or there is nowhere to find
-  peers.
 - **Leech only.** No seeding, no `watch`, no `serve` yet.
+- The DHT is intermittent by nature: a lookup takes a few rounds and can come up
+  empty on a quiet swarm, so a retry is normal. `--no-dht` turns it off.
 - Search sources are third-party indexes and go stale; `essaim sources` lists
   what is compiled in and which rows are enabled.
 

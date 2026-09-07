@@ -1,0 +1,153 @@
+// BEP 5: the Kademlia DHT, so a magnet works with no tracker at all.
+//
+// Without this, essaim could only find peers through a tracker, which means a
+// bare `magnet:?xt=urn:btih:...` had nowhere to go. The DHT replaces that: every
+// participating client is a node in a keyspace of 160-bit ids, and the nodes
+// whose id is XOR-closest to an infohash are the ones that remember who is in
+// that swarm. You start at a bootstrap node, ask for the peers, and it either
+// hands them over or points you at nodes closer than itself -- so each round
+// halves the distance and a lookup converges in a handful of hops.
+//
+// KRPC is bencode over UDP. Queries have to be ENCODED, which the decoder side
+// never needed, and the binary fields (a 20-byte node id, a 20-byte infohash)
+// are built as bytes rather than strings so a NUL cannot truncate them.
+
+type Node struct { ip string  port int  id string }
+
+func dht_bootstrap() (n) { n = []Node{}
+	n = append(n, Node{ip: "router.bittorrent.com", port: 6881, id: ""})
+	n = append(n, Node{ip: "dht.transmissionbt.com", port: 6881, id: ""})
+	n = append(n, Node{ip: "router.utorrent.com", port: 6881, id: ""})
+	n = append(n, Node{ip: "dht.libtorrent.org", port: 25401, id: ""}) }
+
+// ben_str_b prefixes a bencode byte-string with its length.
+func ben_str_b(b) (out) { out = bytes_concat(bytes(str(len(b)) + ":"), b) }
+
+// krpc_get_peers builds `{"a":{"id":..,"info_hash":..},"q":"get_peers","t":..,"y":"q"}`.
+// Bencode dict keys must be in lexicographic order -- a < q < t < y, and
+// id < info_hash inside -- or a strict node drops the query.
+func krpc_get_peers(myid, infohash, tx) (msg) { msg = bytes("d1:ad2:id")
+	msg = bytes_concat(msg, ben_str_b(from_hex(myid)))
+	msg = bytes_concat(msg, bytes("9:info_hash"))
+	msg = bytes_concat(msg, ben_str_b(from_hex(infohash)))
+	msg = bytes_concat(msg, bytes("e1:q9:get_peers1:t"))
+	msg = bytes_concat(msg, ben_str_b(from_hex(tx)))
+	msg = bytes_concat(msg, bytes("1:y1:qe")) }
+
+// nodes_decode reads compact node info: 26 bytes per node, 20 of id then 4 of
+// address and 2 of port.
+func nodes_decode(b) (out) { out = []Node{}
+	i := 0
+	for i + 26 <= len(b) { p := rd16(b, i + 24)
+		if p > 0 { out = append(out, Node{ip: ipv4_str(b, i + 20), port: p, id: to_hex(bytes_sub(b, i, i + 20))}) }
+		i = i + 26 } }
+
+// dist_closer reports whether node id `a` is XOR-closer to target than `b`.
+// Comparing the XOR distances byte by byte is the whole of Kademlia's metric.
+func dist_closer(a, b, target) (yes) { yes = 0
+	if len(a) != 40 { return yes }
+	if len(b) != 40 { yes = 1  return yes }
+	i := 0
+	for i < 20 { av := hexpair(a, i)
+		bv := hexpair(b, i)
+		tv := hexpair(target, i)
+		ax := xor8(av, tv)
+		bx := xor8(bv, tv)
+		if ax < bx { yes = 1  return yes }
+		if ax > bx { return yes }
+		i = i + 1 } }
+
+func hexpair(h, i) (v) { v = 0
+	if i * 2 + 1 < len(h) { v = hex_int(substr(h, i * 2, i * 2 + 2)) } }
+
+// xor8 without a bitwise operator: subtract the bits that both share, twice.
+func xor8(a, b) (v) { v = 0
+	bit := 128
+	x := a
+	y := b
+	for bit >= 1 { xa := x / bit
+		ya := y / bit
+		x = x - xa * bit
+		y = y - ya * bit
+		if xa != ya { v = v + bit }
+		bit = bit / 2 } }
+
+// dht_get_peers runs the iterative lookup. Each round queries the closest nodes
+// not yet asked and folds whatever comes back into the candidate set; peers
+// found along the way accumulate. It stops early once `want` peers are known,
+// because a swarm needs a handful of addresses, not a complete routing table.
+func dht_get_peers(infohash, want, rounds, timeout_ms, progress) (peers, err) { peers = []Peer{}  err = ""
+	fd := udp_socket(0)
+	if fd < 0 { err = "cannot open udp socket"  return peers, err }
+	socket_timeout(fd, timeout_ms)
+	myid := to_hex(rand_bytes(20))
+	cand := dht_bootstrap()
+	asked := []string{}
+	r := 0
+	for r < rounds { if len(peers) >= want { close(fd)  return peers, err }
+		batch := pick_closest(cand, asked, infohash, 8)
+		if len(batch) == 0 { close(fd)
+			if len(peers) == 0 { err = "dht lookup found no nodes" }
+			return peers, err }
+		i := 0
+		for i < len(batch) { udp_sendto(fd, batch[i].ip, batch[i].port, krpc_get_peers(myid, infohash, to_hex(rand_bytes(2))))
+			asked = append(asked, batch[i].ip + ":" + str(batch[i].port))
+			i = i + 1 }
+		// read whatever arrives this round; a silent node just costs one timeout
+		got := 0
+		for got < len(batch) * 2 { got = got + 1
+			data, _, sport := udp_recvfrom(fd)
+			if sport == 0 { break }
+			peers, cand = krpc_absorb(data, peers, cand, asked) }
+		if progress == 1 { eprint("essaim: dht round " + str(r + 1) + " -- " + str(len(peers)) + " peers, " + str(len(cand)) + " nodes known") }
+		r = r + 1 }
+	close(fd)
+	if len(peers) == 0 { err = "dht lookup completed with no peers" } }
+
+// krpc_absorb folds one reply into the peer and candidate sets. Anything that
+// is not a well-formed response is ignored rather than fatal -- the DHT is full
+// of stale nodes, and one bad datagram must not end a lookup.
+func krpc_absorb(data, peers, cand, asked) (outpeers, outcand) { outpeers = peers  outcand = cand
+	if len(data) == 0 { return outpeers, outcand }
+	j := ben_json(data)
+	if j == "" { return outpeers, outcand }
+	// "y":"r" -- the decoder renders byte strings as hex, so "r" is "72"
+	if jraw(j, "y") != "72" { return outpeers, outcand }
+	i := 0
+	for i < 64 { v := jraw(j, "r.values[" + str(i) + "]")
+		if v == "" { break }
+		b := from_hex(v)
+		if len(b) == 6 { p := Peer{ip: ipv4_str(b, 0), port: rd16(b, 4)}
+			if p.port > 0 { if peer_new(outpeers, p) == 1 { outpeers = append(outpeers, p) } } }
+		i = i + 1 }
+	nh := jraw(j, "r.nodes")
+	if nh != "" { ns := nodes_decode(from_hex(nh))
+		k := 0
+		for k < len(ns) { if node_known(outcand, ns[k]) == 0 { outcand = append(outcand, ns[k]) }
+			k = k + 1 } } }
+
+func node_known(list, n) (known) { known = 0
+	i := 0
+	for i < len(list) { if list[i].ip == n.ip { if list[i].port == n.port { known = 1  return known } }
+		i = i + 1 } }
+
+func was_asked(asked, key) (yes) { yes = 0
+	i := 0
+	for i < len(asked) { if asked[i] == key { yes = 1  return yes }  i = i + 1 } }
+
+// pick_closest selects up to n unasked candidates nearest the target. A node
+// with no known id (a bootstrap router) sorts last but is still usable, which
+// is what gets the very first round off the ground.
+func pick_closest(cand, asked, target, n) (out) { out = []Node{}
+	used := []string{}
+	k := 0
+	for k < n { best := 0 - 1
+		i := 0
+		for i < len(cand) { key := cand[i].ip + ":" + str(cand[i].port)
+			if was_asked(asked, key) == 0 { if was_asked(used, key) == 0 { if best < 0 { best = i }
+					if best >= 0 { if dist_closer(cand[i].id, cand[best].id, target) == 1 { best = i } } } }
+			i = i + 1 }
+		if best < 0 { return out }
+		out = append(out, cand[best])
+		used = append(used, cand[best].ip + ":" + str(cand[best].port))
+		k = k + 1 } }

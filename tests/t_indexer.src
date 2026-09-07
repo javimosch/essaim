@@ -82,7 +82,7 @@ func main() { j := scan_json(src_apibay(), fx_apibay(), "", 10)
 	expect("header-missing", header_of(loc, "nope"), "")
 	// sources table is the config surface: every row must be well formed
 	all := sources_default()
-	expect("sources-count", str(len(all)), "6")
+	expect("sources-count", str(len(all)), "7")
 	i := 0
 	bad := 0
 	for i < len(all) { if all[i].name == "" { bad = bad + 1 }

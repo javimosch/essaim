@@ -1,0 +1,93 @@
+var g_fail = 0
+
+func expect(name, got, want) { if got == want { println("ok   " + name)  return }
+	println("FAIL " + name + "\n  got  " + got + "\n  want " + want)
+	g_fail = g_fail + 1 }
+
+func main() { // XOR without a bitwise operator -- the whole Kademlia metric rests on it
+	expect("xor-same", str(xor8(255, 255)), "0")
+	expect("xor-zero", str(xor8(0, 255)), "255")
+	expect("xor-mixed", str(xor8(170, 85)), "255")
+	expect("xor-partial", str(xor8(12, 10)), "6")
+	expect("xor-high-bit", str(xor8(128, 0)), "128")
+	// distance ordering: an id equal to the target is closest of all
+	t := "00000000000000000000000000000000000000ff"
+	near := "00000000000000000000000000000000000000ff"
+	far := "ff00000000000000000000000000000000000000"
+	expect("dist-exact-closer", str(dist_closer(near, far, t)), "1")
+	expect("dist-far-not-closer", str(dist_closer(far, near, t)), "0")
+	// a node with no known id (a bootstrap router) must never win the ordering,
+	// but an unknown vs unknown comparison must still terminate
+	expect("dist-unknown-loses", str(dist_closer("", far, t)), "0")
+	expect("dist-known-beats-unknown", str(dist_closer(far, "", t)), "1")
+	// KRPC query framing. Bencode dict keys MUST be lexicographic (a<q<t<y,
+	// and id<info_hash inside) or a strict node silently drops the query.
+	id := "0102030405060708090a0b0c0d0e0f1011121314"
+	ih := "aabbccddeeff00112233445566778899aabbccdd"
+	// NB: the transaction id is a HEX string like every other binary field here;
+	// passing non-hex silently yields a short field rather than an error.
+	q := krpc_get_peers(id, ih, "3a3b")
+	qs := bytes_str(bytes_sub(q, 0, 9))
+	expect("krpc-prefix", qs, "d1:ad2:id")
+	expect("krpc-len", str(len(q)), "95")
+	// pin the exact wire bytes: a reordered key or a miscounted length prefix
+	// would still decode locally but be dropped by a strict node
+	expect("krpc-exact", to_hex(q), "64313a6164323a696432303a0102030405060708090a0b0c0d0e0f1011121314393a696e666f5f6861736832303aaabbccddeeff00112233445566778899aabbccdd65313a71393a6765745f7065657273313a74323a3a3b313a79313a7165")
+	expect("krpc-id-embedded", str(bytes_index(q, from_hex(id), 0) > 0), "true")
+	expect("krpc-hash-embedded", str(bytes_index(q, from_hex(ih), 0) > 0), "true")
+	expect("krpc-method", str(bytes_index(q, bytes("1:q9:get_peers"), 0) > 0), "true")
+	expect("krpc-tail", bytes_str(bytes_sub(q, len(q) - 7, len(q))), "1:y1:qe")
+	// the query we build must be decodable by our own bencode reader
+	j := ben_json(q)
+	expect("krpc-roundtrip-y", jraw(j, "y"), to_hex(bytes("q")))
+	expect("krpc-roundtrip-hash", jraw(j, "a.info_hash"), ih)
+	expect("krpc-roundtrip-id", jraw(j, "a.id"), id)
+	// compact node info: 26 bytes each, 20 of id then 4 of address and 2 of port
+	nb := from_hex(id + "c0a80101" + "1ae1" + ih + "0a000005" + "0050")
+	ns := nodes_decode(nb)
+	expect("nodes-n", str(len(ns)), "2")
+	if len(ns) > 1 { expect("nodes-ip0", ns[0].ip, "192.168.1.1")
+		expect("nodes-port0", str(ns[0].port), "6881")
+		expect("nodes-id0", ns[0].id, id)
+		expect("nodes-ip1", ns[1].ip, "10.0.0.5") }
+	// a ragged tail is ignored, not read past the end
+	expect("nodes-ragged", str(len(nodes_decode(from_hex(id + "c0a801011ae1" + "aabb")))), "1")
+	expect("nodes-empty", str(len(nodes_decode(bytes("")))), "0")
+	// absorbing a reply: values become peers, nodes become candidates
+	vals := "d1:rd2:id20:....................6:valuesl6:......6:......ee1:t2:aa1:y1:re"
+	reply := bytes_concat(bytes_concat(bytes("d1:rd2:id"), ben_str_b(from_hex(id))), bytes("6:valuesl"))
+	reply = bytes_concat(reply, ben_str_b(from_hex("c0a801011ae1")))
+	reply = bytes_concat(reply, ben_str_b(from_hex("0a0000050050")))
+	reply = bytes_concat(reply, bytes("ee1:t2:aa1:y1:re"))
+	p0 := []Peer{}
+	c0 := []Node{}
+	p1, c1 := krpc_absorb(reply, p0, c0, []string{})
+	expect("absorb-peers", str(len(p1)), "2")
+	if len(p1) > 0 { expect("absorb-peer0", p1[0].ip + ":" + str(p1[0].port), "192.168.1.1:6881") }
+	expect("absorb-nodes-none", str(len(c1)), "0")
+	// a reply carrying nodes instead of values feeds the next round
+	nr := bytes_concat(bytes_concat(bytes("d1:rd2:id"), ben_str_b(from_hex(id))), bytes("5:nodes"))
+	nr = bytes_concat(nr, ben_str_b(nb))
+	nr = bytes_concat(nr, bytes("e1:t2:aa1:y1:re"))
+	p2, c2 := krpc_absorb(nr, []Peer{}, []Node{}, []string{})
+	expect("absorb-nodes", str(len(c2)), "2")
+	expect("absorb-nodes-nopeers", str(len(p2)), "0")
+	// junk and error replies are ignored, never fatal: the DHT is full of both
+	p3, c3 := krpc_absorb(bytes("not bencode"), []Peer{}, []Node{}, []string{})
+	expect("absorb-junk-peers", str(len(p3)), "0")
+	expect("absorb-junk-nodes", str(len(c3)), "0")
+	p4, _ := krpc_absorb(bytes("d1:eli201e9:Server Ere1:t2:aa1:y1:ee"), []Peer{}, []Node{}, []string{})
+	expect("absorb-error-reply", str(len(p4)), "0")
+	// candidate selection must not re-ask a node and must respect the cap
+	cands := []Node{Node{ip: "1.1.1.1", port: 1, id: near}, Node{ip: "2.2.2.2", port: 2, id: far}, Node{ip: "3.3.3.3", port: 3, id: ""}}
+	pick := pick_closest(cands, []string{}, t, 2)
+	expect("pick-n", str(len(pick)), "2")
+	if len(pick) > 0 { expect("pick-closest-first", pick[0].ip, "1.1.1.1") }
+	expect("pick-skips-asked", str(len(pick_closest(cands, []string{"1.1.1.1:1", "2.2.2.2:2", "3.3.3.3:3"}, t, 3))), "0")
+	expect("pick-caps", str(len(pick_closest(cands, []string{}, t, 99))), "3")
+	// bootstrap set must be non-empty or a lookup can never start
+	expect("bootstrap", str(len(dht_bootstrap()) > 0), "true")
+	expect("benstr", bytes_str(ben_str_b(bytes("abc"))), "3:abc")
+	expect("benstr-empty", bytes_str(ben_str_b(bytes(""))), "0:")
+	if g_fail == 0 { println("\nALL PASS") }
+	if g_fail > 0 { println("\n" + str(g_fail) + " FAILED")  exit(1) } }

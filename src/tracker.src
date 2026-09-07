@@ -108,3 +108,9 @@ func udp_url_split(url) (host, port) { host = ""  port = 0
 	host = substr(rest, 0, colon)
 	port = parse_int(substr(rest, colon + 1, len(rest)))
 	if port <= 0 { host = "" } }
+
+// peer_new reports whether an address is not already in a peer list. It lives
+// here beside Peer because both the tracker and the DHT pool addresses.
+func peer_new(list, p) (isnew) { isnew = 1
+	i := 0
+	for i < len(list) { if list[i].ip == p.ip { if list[i].port == p.port { isnew = 0  return isnew } }  i = i + 1 } }

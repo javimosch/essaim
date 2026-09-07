@@ -248,7 +248,7 @@ OpenSSL archives for musl.
 
 ```sh
 ./build.sh      # machin encode src/*.src > essaim.mfl && machin build essaim.mfl
-./tests/run.sh  # 285 assertions across 11 suites
+./tests/run.sh  # 325 assertions across 11 module suites + a CLI suite
 ```
 
 Tests need no network: the tracker suite stands up a fake BEP 15 tracker, the

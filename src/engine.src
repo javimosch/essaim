@@ -102,23 +102,10 @@ func job_start(id, t, dir, peers, peerid, timeout, down_limit_kbs) (j) { j = Job
 		go dpacer(j.dgrant, interval) }
 	i = 0
 	for i < t.npieces { if j.have[i] == 0 { j.work <- i }  i = i + 1 }
-	// A cap has to bound CONCURRENCY as well as rate, or it wastes almost
-	// everything it transfers. Blocks are only persisted once a whole piece
-	// verifies, so with one grant stream shared by dozens of peers every peer
-	// crawls through a partial piece and none of them finish -- measured: 27
-	// peers at 256 KB/s completed ONE piece in 13 s while the bytes for many
-	// others were downloaded and then thrown away on exit.
-	//
-	// One worker per 64 KB/s of budget keeps each peer fast enough to finish
-	// pieces, so the bytes that arrive are bytes that get kept.
-	maxw := len(peers)
-	if down_limit_kbs > 0 { maxw = down_limit_kbs / 64
-		if maxw < 1 { maxw = 1 }
-		if maxw > len(peers) { maxw = len(peers) } }
 	i = 0
-	for i < len(peers) { if i < maxw { go peer_worker(peers[i].ip, peers[i].port, t, dir, t.infohash, peerid, j.work, j.res, timeout, j.dgrant, j.dlimited)
-			j.live = j.live + 1
-			j.nworkers = j.nworkers + 1 }
+	for i < len(peers) { go peer_worker(peers[i].ip, peers[i].port, t, dir, t.infohash, peerid, j.work, j.res, timeout, j.dgrant, j.dlimited)
+		j.live = j.live + 1
+		j.nworkers = j.nworkers + 1
 		i = i + 1 }
 	if j.live == 0 { j.active = 0 } }
 

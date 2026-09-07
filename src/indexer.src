@@ -25,15 +25,20 @@ type Source struct { name string  kind string  cat string  url string  mode stri
 // infohash; peers still have to be found, and without a DHT that means trackers.
 func default_trackers() (t) { t = []string{"udp://tracker.opentrackr.org:1337/announce", "udp://open.demonii.com:1337/announce", "udp://tracker.torrent.eu.org:451/announce", "udp://exodus.desync.com:6969/announce"} }
 
-// sources_default is torlink's curated set, expressed declaratively. Each row is
-// data: no source has any code of its own.
+// sources_default is the compiled-in source table. Each row is DATA -- no source
+// has any code of its own, so adding or changing one is a table edit.
+//
+// Only archive.org is enabled out of the box. The other rows ship disabled and
+// are present as worked examples of the two response shapes: flip `enabled` to 1
+// (or add your own row) and rebuild. essaim takes no position on, and no
+// responsibility for, what any third-party index returns.
 func sources_default() (s) { s = []Source{}
-	s = append(s, Source{name: "piratebay", kind: "json", cat: "all", url: "https://apibay.org/q.php?q={q}", mode: "index", probe: ".[{i}].name", f_name: ".[{i}].name", f_hash: ".[{i}].info_hash", f_size: ".[{i}].size", f_seed: ".[{i}].seeders", enabled: 1})
-	s = append(s, Source{name: "yts", kind: "json", cat: "movies", url: "https://yts.mx/api/v2/list_movies.json?limit=30&query_term={q}", mode: "index", probe: ".data.movies[{i}].title_long", f_name: ".data.movies[{i}].title_long", f_hash: ".data.movies[{i}].torrents[0].hash", f_size: ".data.movies[{i}].torrents[0].size_bytes", f_seed: ".data.movies[{i}].torrents[0].seeds", enabled: 1})
-	s = append(s, Source{name: "nyaa", kind: "rss", cat: "anime", url: "https://nyaa.si/?page=rss&q={q}", mode: "item", probe: "<title>([^<]*)</title>", f_name: "<title>([^<]*)</title>", f_hash: "<nyaa:infoHash>([0-9a-fA-F]{40})</nyaa:infoHash>", f_size: "<nyaa:size>([^<]*)</nyaa:size>", f_seed: "<nyaa:seeders>([0-9]+)</nyaa:seeders>", enabled: 1})
-	s = append(s, Source{name: "subsplease", kind: "rss", cat: "anime", url: "https://subsplease.org/rss/?t&r=1080p", mode: "item", probe: "<title>([^<]*)</title>", f_name: "<title>([^<]*)</title>", f_hash: "btih:([0-9a-fA-F]{40})", f_size: "<size>([^<]*)</size>", f_seed: "<seeders>([0-9]+)</seeders>", filter: "local", enabled: 1})
+	s = append(s, Source{name: "piratebay", kind: "json", cat: "all", url: "https://apibay.org/q.php?q={q}", mode: "index", probe: ".[{i}].name", f_name: ".[{i}].name", f_hash: ".[{i}].info_hash", f_size: ".[{i}].size", f_seed: ".[{i}].seeders", enabled: 0})
+	s = append(s, Source{name: "yts", kind: "json", cat: "movies", url: "https://yts.mx/api/v2/list_movies.json?limit=30&query_term={q}", mode: "index", probe: ".data.movies[{i}].title_long", f_name: ".data.movies[{i}].title_long", f_hash: ".data.movies[{i}].torrents[0].hash", f_size: ".data.movies[{i}].torrents[0].size_bytes", f_seed: ".data.movies[{i}].torrents[0].seeds", enabled: 0})
+	s = append(s, Source{name: "nyaa", kind: "rss", cat: "anime", url: "https://nyaa.si/?page=rss&q={q}", mode: "item", probe: "<title>([^<]*)</title>", f_name: "<title>([^<]*)</title>", f_hash: "<nyaa:infoHash>([0-9a-fA-F]{40})</nyaa:infoHash>", f_size: "<nyaa:size>([^<]*)</nyaa:size>", f_seed: "<nyaa:seeders>([0-9]+)</nyaa:seeders>", enabled: 0})
+	s = append(s, Source{name: "subsplease", kind: "rss", cat: "anime", url: "https://subsplease.org/rss/?t&r=1080p", mode: "item", probe: "<title>([^<]*)</title>", f_name: "<title>([^<]*)</title>", f_hash: "btih:([0-9a-fA-F]{40})", f_size: "<size>([^<]*)</size>", f_seed: "<seeders>([0-9]+)</seeders>", filter: "local", enabled: 0})
 	s = append(s, Source{name: "archive", kind: "json", cat: "all", url: "https://archive.org/services/search/v1/scrape?q=format%3A%22Archive+BitTorrent%22+AND+%28{q}%29&count=100&fields=identifier,item_size", mode: "index", probe: ".items[{i}].identifier", f_name: ".items[{i}].identifier", f_hash: "", f_size: ".items[{i}].item_size", f_seed: "", f_link: "https://archive.org/download/{v}/{v}_archive.torrent", enabled: 1})
-	s = append(s, Source{name: "eztv", kind: "json", cat: "tv", url: "https://eztvx.to/api/get-torrents?limit=50&keywords={q}", mode: "index", probe: ".torrents[{i}].title", f_name: ".torrents[{i}].title", f_hash: ".torrents[{i}].hash", f_size: ".torrents[{i}].size_bytes", f_seed: ".torrents[{i}].seeds", filter: "local", enabled: 1}) }
+	s = append(s, Source{name: "eztv", kind: "json", cat: "tv", url: "https://eztvx.to/api/get-torrents?limit=50&keywords={q}", mode: "index", probe: ".torrents[{i}].title", f_name: ".torrents[{i}].title", f_hash: ".torrents[{i}].hash", f_size: ".torrents[{i}].size_bytes", f_seed: ".torrents[{i}].seeds", filter: "local", enabled: 0}) }
 
 type Hit struct { source string  name string  infohash string  size int  seeders int  magnet string  torrent string }
 

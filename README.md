@@ -45,21 +45,22 @@ Sources are **config rows, not code** — adding one is a table entry in
 [`src/indexer.src`](src/indexer.src): a URL template, how to walk the response,
 and where the fields live.
 
-| source | kind | category |
-|---|---|---|
-| piratebay | JSON | all |
-| archive.org | JSON (`.torrent` links) | all |
-| yts | JSON | movies |
-| eztv | JSON | tv |
-| nyaa | RSS | anime |
-| subsplease | RSS | anime |
+**Only archive.org is enabled out of the box.** The other rows ship *disabled*
+and exist as worked examples of the two supported response shapes — flip
+`enabled` to `1`, or add your own row, and rebuild.
 
-Two response shapes cover all of them: a JSON API addressed by path templates
-(`{i}` = row index) and an RSS feed split on `<item>` and read with regexes.
-A source that errors is skipped with a note on stderr — one dead index must not
-sink a search. Sources marked `filter: "local"` return a firehose (EZTV filters
-only by IMDb id; SubsPlease has no query at all), so essaim narrows those rows
-itself.
+| source | kind | category | default |
+|---|---|---|---|
+| archive.org | JSON (`.torrent` links) | all | **enabled** |
+| others (5) | JSON / RSS examples | various | disabled |
+
+Two response shapes cover every index worth querying: a JSON API addressed by
+path templates (`{i}` = row index) and an RSS feed split on `<item>` and read
+with regexes. A source that errors is skipped with a note on stderr — one dead
+index must not sink a search. Rows marked `filter: "local"` return a firehose
+regardless of the query, so essaim narrows them itself.
+
+`essaim sources` lists what is compiled in and which rows are live.
 
 ## Agent-first conventions
 
@@ -107,8 +108,27 @@ index suite parses recorded response fixtures.
   peers.
 - **Leech only.** No seeding, no `watch`, no `serve` yet.
 - Search sources are third-party indexes and go stale; `essaim sources` lists
-  what is compiled in.
+  what is compiled in and which rows are enabled.
+
+## Status and disclaimer
+
+essaim is an **experiment**: it exists to dogfood
+[machin](https://github.com/javimosch/machin) by building something demanding in
+it — a real binary protocol, real concurrency, real network failure modes — and
+it drove two additions into the language along the way (`udp_socket` /
+`udp_sendto` / `udp_recvfrom` and `write_file_at`).
+
+It is provided as-is, with **no warranty and no responsibility taken for how it
+is used or for anything any third-party index returns**. You are responsible for
+what you download and for complying with the law and the terms of any service you
+point it at. See the MIT licence.
+
+## Credits
+
+Designed and written with [Claude Code](https://claude.com/claude-code), which
+holds authorship of essentially all of this repository — the protocol
+implementations, the test suites, and the machin language changes underneath it.
 
 ## Licence
 
-MIT.
+MIT — see [LICENSE](LICENSE).

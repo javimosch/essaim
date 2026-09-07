@@ -1,0 +1,86 @@
+var g_fail = 0
+
+func expect(name, got, want) { if got == want { println("ok   " + name)  return }
+	println("FAIL " + name + "\n  got  " + got + "\n  want " + want)
+	g_fail = g_fail + 1 }
+
+// A torrent whose pieces are one 16 KiB block each, so the rate limiter has
+// something measurable to pace without making the test slow.
+func mk(dir, npieces, plen) (t) { body := ""
+	i := 0
+	for i < plen { body = body + "x"  i = i + 1 }
+	all := ""
+	k := 0
+	for k < npieces { all = all + body  k = k + 1 }
+	mkdir_p(dir)
+	write_file(dir + "/big.bin", all)
+	hashes := ""
+	k = 0
+	for k < npieces { hashes = hashes + to_hex(sha1_bytes(bytes_sub(bytes(all), k * plen, k * plen + plen)))  k = k + 1 }
+	f := TFile{path: "big.bin", length: npieces * plen, offset: 0}
+	t = Torrent{name: "big.bin", infohash: "0123456789abcdef0123456789abcdef01234567", piecelen: plen, total: npieces * plen, npieces: npieces, pieces: hashes, files: []TFile{f}, announce: []string{}, ok: 1} }
+
+func serve(t, dir, port, cap, dur, done) { up, np, err := seed_serve(t, dir, port, cap, dur, peer_id_new(), 0)
+	done <- json(SeedStat{kind: err, peer: "", bytes: up, piece: np}) }
+
+func main() { // bitfield rendering, MSB first within each byte
+	expect("bf-all-set", to_hex(have_bitfield([]int{1, 1, 1, 1, 1, 1, 1, 1})), "ff")
+	expect("bf-none", to_hex(have_bitfield([]int{0, 0, 0, 0, 0, 0, 0, 0})), "00")
+	expect("bf-msb-first", to_hex(have_bitfield([]int{1, 0, 0, 0, 0, 0, 0, 0})), "80")
+	expect("bf-lsb", to_hex(have_bitfield([]int{0, 0, 0, 0, 0, 0, 0, 1})), "01")
+	expect("bf-partial-byte", to_hex(have_bitfield([]int{1, 0, 1})), "a0")
+	expect("bf-two-bytes", to_hex(have_bitfield([]int{1, 1, 1, 1, 1, 1, 1, 1, 1, 0})), "ff80")
+	// a bitfield must round-trip through the reader the leecher uses
+	bf := have_bitfield([]int{1, 0, 1, 1, 0, 0, 0, 0, 1})
+	expect("bf-roundtrip0", str(bitfield_has(bf, 0)), "1")
+	expect("bf-roundtrip1", str(bitfield_has(bf, 1)), "0")
+	expect("bf-roundtrip3", str(bitfield_has(bf, 3)), "1")
+	expect("bf-roundtrip8", str(bitfield_has(bf, 8)), "1")
+	expect("bf-past-end", str(bitfield_has(bf, 99)), "0")
+	// store_read_range must span files and clamp, since serving a block reads
+	// an arbitrary byte range rather than a whole piece
+	rdir := "/tmp/essaim-seed-range"
+	system("rm -rf " + rdir)
+	mkdir_p(rdir)
+	write_file(rdir + "/a", "ABCDE")
+	write_file(rdir + "/b", "FGHIJ")
+	rt := Torrent{name: "d", piecelen: 4, total: 10, npieces: 3, files: []TFile{TFile{path: "a", length: 5, offset: 0}, TFile{path: "b", length: 5, offset: 5}}, announce: []string{}, ok: 1}
+	expect("range-within", bytes_str(store_read_range(rt, rdir, 1, 4)), "BCD")
+	expect("range-straddle", bytes_str(store_read_range(rt, rdir, 3, 7)), "DEFG")
+	expect("range-second", bytes_str(store_read_range(rt, rdir, 5, 10)), "FGHIJ")
+	expect("range-all", bytes_str(store_read_range(rt, rdir, 0, 10)), "ABCDEFGHIJ")
+	system("rm -rf " + rdir)
+	// end to end: essaim seeds to essaim, over the real peer protocol
+	sdir := "/tmp/essaim-seed-src"
+	ldir := "/tmp/essaim-seed-dst"
+	system("rm -rf " + sdir + " " + ldir)
+	t := mk(sdir, 8, 16384)
+	done := make(chan string)
+	go serve(t, sdir, 51771, 0, 6000, done)
+	sleep(400)
+	s := engine_download(t, ldir, []Peer{Peer{ip: "127.0.0.1", port: 51771}}, peer_id_new(), 5000, 15000, 0)
+	expect("xfer-complete", str(s.complete), "1")
+	expect("xfer-pieces", str(s.done), "8")
+	expect("xfer-bytes", str(s.bytes), "131072")
+	expect("xfer-content", str(file_size(ldir + "/big.bin")), "131072")
+	r := parse(<-done, SeedStat{})
+	expect("seed-noerror", r.kind, "")
+	expect("seed-uploaded", str(r.bytes), "131072")
+	expect("seed-peers", str(r.piece), "1")
+	// a capped seeder must actually be slower. 8 blocks at 64 KB/s is 250 ms
+	// per block; a burst of 4 is allowed up front, so >= 700 ms is the floor a
+	// working limiter cannot beat, while an unlimited one finishes in ~10 ms.
+	ldir2 := "/tmp/essaim-seed-dst2"
+	system("rm -rf " + ldir2)
+	done2 := make(chan string)
+	go serve(t, sdir, 51772, 64, 12000, done2)
+	sleep(400)
+	t0 := now_ms()
+	s2 := engine_download(t, ldir2, []Peer{Peer{ip: "127.0.0.1", port: 51772}}, peer_id_new(), 8000, 20000, 0)
+	el := now_ms() - t0
+	expect("capped-complete", str(s2.complete), "1")
+	expect("capped-is-slower", str(el >= 700), "true")
+	if el < 700 { println("  (capped transfer took " + str(el) + " ms, expected >= 700)") }
+	system("rm -rf " + sdir + " " + ldir + " " + ldir2)
+	if g_fail == 0 { println("\nALL PASS") }
+	if g_fail > 0 { println("\n" + str(g_fail) + " FAILED")  exit(1) } }

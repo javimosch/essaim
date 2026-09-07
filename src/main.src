@@ -27,11 +27,39 @@ func main() { a := args()
 	if cmd == "search" { cmd_search(a) }
 	if cmd == "sources" { cmd_sources() }
 	if cmd == "peers" { cmd_peers(a) }
+	if cmd == "seed" { cmd_seed(a) }
 	if cmd == "install" { cmd_install(a) }
 	if cmd == "uninstall" { cmd_uninstall(a) }
 	if cmd == "update" { cmd_update(a) }
 	if cmd == "feedback" { cmd_feedback(a) }
 	fail(EXIT_ARGS, "unknown_command", "no such command: " + cmd, []string{"essaim help-json", "essaim guide"}) }
+
+// cmd_seed serves a torrent you already hold. Seeding is OPT-IN: nothing here
+// runs unless this command (or `get --seed`) is invoked, so essaim never opens a
+// listening port or uploads a byte by default.
+func cmd_seed(a) { src := arg_at(a, 2)
+	if src == "" { fail(EXIT_ARGS, "missing_argument", "seed needs the .torrent (or magnet) describing what you are sharing", []string{"essaim seed ./file.torrent --dir ./dl"}) }
+	dir := flag_val(a, "--dir", ".")
+	port := parse_int(flag_val(a, "--port", "6881"))
+	uplimit := parse_int(flag_val(a, "--up-limit", "0"))
+	duration := parse_int(flag_val(a, "--duration", "3600000"))
+	timeout := parse_int(flag_val(a, "--timeout", "15000"))
+	quiet := flag_on(a, "--quiet")
+	progress := 1 - quiet
+	pid := peer_id_new()
+	raw := bytes("")
+	err := ""
+	if has_prefix(src, "magnet:") { raw, _ = resolve_magnet(src, pid, port, timeout, progress, flag_on(a, "--no-dht")) }
+	if has_prefix(src, "magnet:") == false { raw, err = source_bytes(src) }
+	if err == "notfound" { fail(EXIT_NOTFOUND, "not_found", "cannot read " + src, []string{"check the path"}) }
+	if err != "" { fail(EXIT_NETWORK, "fetch_failed", "could not fetch " + src + ": " + err, []string{"retry"}) }
+	t := torrent_parse(raw)
+	if t.ok == 0 { fail(EXIT_VALUE, "bad_torrent", t.err, []string{}) }
+	announced := 0
+	if flag_on(a, "--no-announce") == 0 { announced = seed_announce(t, pid, port, timeout, progress) }
+	up, npeers, serr := seed_serve(t, dir, port, uplimit, duration, pid, progress)
+	if serr != "" { fail(EXIT_VALIDATION, "cannot_seed", serr, []string{"run `essaim get` first, or point --dir at the finished files"}) }
+	emit("{\"infohash\":\"" + t.infohash + "\",\"name\":\"" + jesc(t.name) + "\",\"port\":" + str(port) + ",\"uploaded_bytes\":" + str(up) + ",\"peers_served\":" + str(npeers) + ",\"trackers_announced\":" + str(announced) + ",\"up_limit_kbs\":" + str(uplimit) + ",\"seconds\":" + str(duration / 1000) + "}") }
 
 // cmd_peers answers "is this swarm alive?" without downloading a byte. It is
 // also the honest way to see the DHT working on its own: pass --no-trackers and
@@ -164,11 +192,16 @@ func cmd_get(a) { src := arg_at(a, 2)
 	if t.ok == 0 { fail(EXIT_VALUE, "bad_torrent", t.err, []string{"the file may be html, not a .torrent"}) }
 	if mkdir_p(dir) == 0 { fail(EXIT_VALUE, "bad_dir", "cannot create " + dir, []string{"pick a writable --dir"}) }
 	if progress == 1 { eprint("essaim: " + t.name + " -- " + str(t.total) + " bytes in " + str(t.npieces) + " pieces") }
+	// --peer pins an explicit address, which is how a direct transfer between two
+	// machines works with no tracker and no DHT at all.
+	manual := parse_peers(flag_val(a, "--peer", ""))
+	if len(manual) > 0 { peers = manual }
 	if len(peers) == 0 { peers = gather_peers(t.announce, t.infohash, t.total, pid, port, timeout, progress) }
-	if flag_on(a, "--no-dht") == 0 { if len(peers) < 4 { dp, derr := dht_get_peers(t.infohash, 30, 8, 3000, progress)
+	if len(manual) > 0 { if flag_on(a, "--no-dht") == 0 { } }
+	if len(manual) == 0 { if flag_on(a, "--no-dht") == 0 { if len(peers) < 4 { dp, derr := dht_get_peers(t.infohash, 30, 8, 3000, progress)
 			if derr != "" { if progress == 1 { eprint("essaim: dht -> " + derr) } }
 			k := 0
-			for k < len(dp) { if peer_new(peers, dp[k]) == 1 { peers = append(peers, dp[k]) }  k = k + 1 } } }
+			for k < len(dp) { if peer_new(peers, dp[k]) == 1 { peers = append(peers, dp[k]) }  k = k + 1 } } } }
 	if len(peers) == 0 { fail(EXIT_NETWORK, "no_peers", "neither the trackers nor the DHT returned a peer for " + t.infohash, []string{"retry -- swarms are intermittent", "check network reachability to udp trackers"}) }
 	if progress == 1 { eprint("essaim: " + str(len(peers)) + " peers, starting") }
 	s := engine_download(t, dir, peers, pid, timeout, deadline, progress)
@@ -196,6 +229,17 @@ func resolve_magnet(src, pid, port, timeout, progress, nodht) (raw, peers) { raw
 	r, err := meta_from_swarm(peers, m.infohash, pid, 8000, progress)
 	if err != "" { fail(EXIT_EXTERNAL, "metadata_failed", "could not fetch metadata from any peer: " + err, []string{"retry -- another peer may serve it", "use a .torrent file instead"}) }
 	raw = r }
+
+// parse_peers reads a comma-separated list of ip:port addresses.
+func parse_peers(spec) (out) { out = []Peer{}
+	if trim(spec) == "" { return out }
+	parts := split(trim(spec), ",")
+	i := 0
+	for i < len(parts) { hp := trim(parts[i])
+		c := index(hp, ":")
+		if c > 0 { p := parse_int(substr(hp, c + 1, len(hp)))
+			if p > 0 { out = append(out, Peer{ip: substr(hp, 0, c), port: p}) } }
+		i = i + 1 } }
 
 func boolstr(v) (s) { s = "false"
 	if v == 1 { s = "true" } }

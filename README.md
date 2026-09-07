@@ -12,6 +12,7 @@ essaim peers  <infohash> --no-trackers         # who is in the swarm, via DHT on
 essaim info   ./file.torrent                   # read metadata, download nothing
 essaim get    ./file.torrent --dir ./dl        # or a magnet, or a https URL
 essaim info   "magnet:?xt=urn:btih:…" --fetch  # list the files, download nothing
+essaim seed   ./file.torrent --dir ./dl --up-limit 500   # share, capped
 essaim guide                                   # the whole mental model, embedded
 ```
 
@@ -30,7 +31,8 @@ always equals `error.code` in the body.
 | **DHT** | BEP 5 Kademlia — a bare magnet with no trackers works |
 | **Verification** | nothing is believed until a piece's SHA-1 matches the torrent's commitment |
 | **Resume** | no progress journal — the files on disk *are* the state |
-| **Search** | five indexes, each a declarative config row |
+| **Seeding** | opt-in, with a **global** upload cap in KB/s |
+| **Search** | indexes as declarative config rows |
 
 ## Live-verified
 
@@ -42,6 +44,8 @@ always equals `error.code` in the body.
   → `unzip -t` reports no errors
 - **DHT**: 56 peers found for a busy swarm with trackers *fully disabled*, and a
   bare trackerless magnet resolved its full 15-file listing via DHT → BEP 9
+- **Seeding**: essaim served a torrent to another essaim at 6.2 MB/s uncapped,
+  and the global cap held across three rates — 512→518, 1024→1058, 2048→2136 KB/s
 - `machin build --race-safe` passes: the engine is **proved** data-race free
 
 ## Search sources
@@ -73,6 +77,30 @@ index must not sink a search. Rows marked `filter: "local"` return a firehose
 regardless of the query, so essaim narrows them itself.
 
 `essaim sources` lists what is compiled in and which rows are live.
+
+## Seeding
+
+**Off by default.** essaim opens no listening port and uploads nothing unless you
+ask:
+
+```sh
+essaim seed ./file.torrent --dir ./dl --up-limit 500    # share what you have
+essaim get  ./file.torrent --dir ./dl --seed            # download, then keep seeding
+```
+
+`--up-limit` is a **global** cap in KB/s — a token bucket shared by every
+connection, not a per-peer limit. A burst of up to 4 blocks is allowed, so a very
+short transfer can measure a few percent over the cap; over any real duration it
+converges.
+
+Two machines, no tracker and no DHT:
+
+```sh
+# on the sender
+essaim seed ./f.torrent --dir ./dl --port 51413 --no-announce
+# on the receiver
+essaim get  ./f.torrent --dir ./in --peer 10.0.0.2:51413 --no-dht
+```
 
 ## Agent-first conventions
 
@@ -107,7 +135,7 @@ OpenSSL archives for musl.
 
 ```sh
 ./build.sh      # machin encode src/*.src > essaim.mfl && machin build essaim.mfl
-./tests/run.sh  # 228 assertions across 9 suites
+./tests/run.sh  # 252 assertions across 10 suites
 ```
 
 Tests need no network: the tracker suite stands up a fake BEP 15 tracker, the
@@ -116,7 +144,7 @@ index suite parses recorded response fixtures.
 
 ## Limits
 
-- **Leech only.** No seeding, no `watch`, no `serve` yet.
+- No `watch` (folder monitoring) and no `serve`/daemon mode yet.
 - The DHT is intermittent by nature: a lookup takes a few rounds and can come up
   empty on a quiet swarm, so a retry is normal. `--no-dht` turns it off.
 - Search sources are third-party indexes and go stale; `essaim sources` lists

@@ -27,12 +27,11 @@ func store_write_piece(t, dir, idx, data) (n) { n = 0
 			n = n + w }
 		i = i + 1 } }
 
-// store_read_piece reads a piece back off disk, reassembling it across files.
-// Used to re-verify on resume: essaim keeps no separate progress journal, the
-// files themselves are the state, so a restart re-checks what is already there.
-func store_read_piece(t, dir, idx) (data) { data = bytes("")
-	start := idx * t.piecelen
-	stop := start + piece_size(t, idx)
+// store_read_range reads an arbitrary byte range of the torrent's flat stream,
+// reassembling it across whatever files it spans. Serving a peer means answering
+// 16 KiB block requests, and reading a whole 1 MiB piece to satisfy each one
+// would re-read the same piece 64 times.
+func store_read_range(t, dir, start, stop) (data) { data = bytes("")
 	i := 0
 	for i < len(t.files) { f := t.files[i]
 		lo := start
@@ -45,6 +44,11 @@ func store_read_piece(t, dir, idx) (data) { data = bytes("")
 			if b > len(whole) { data = bytes("")  return data }
 			data = bytes_concat(data, bytes_sub(whole, a, b)) }
 		i = i + 1 } }
+
+// store_read_piece reads a piece back off disk. Used to re-verify on resume:
+// essaim keeps no separate progress journal, the files themselves are the state,
+// so a restart re-checks what is already there.
+func store_read_piece(t, dir, idx) (data) { data = store_read_range(t, dir, idx * t.piecelen, idx * t.piecelen + piece_size(t, idx)) }
 
 // piece_ok is the only thing that decides a piece is real: its SHA-1 must match
 // the hash the torrent committed to. A peer can send anything.

@@ -1,0 +1,135 @@
+// Seeding: serving pieces to other peers. OPT-IN -- essaim never listens on a
+// port or uploads a byte unless you ask it to, with `essaim seed` or
+// `essaim get --seed`.
+//
+// The upload cap is GLOBAL, not per connection, which is the only kind worth
+// having on a shared link. It is a token bucket run as a goroutine: uploaders
+// block on a grant channel before each block and acknowledge after sending, so
+// the pacer knows how many grants are outstanding and never lets an idle period
+// bank an unbounded burst. Channels rather than a shared counter because a
+// goroutine's arena dies with it -- and because that is what machin's race
+// analysis is built to verify.
+
+type SeedStat struct { kind string  peer string  bytes int  piece int }
+
+// pacer issues one grant per block at the configured rate. `burst` bounds how
+// far ahead of consumption it will run, so a quiet minute cannot be cashed in
+// as one huge spike.
+func pacer(grant, ack, interval_ms, burst) { outstanding := 0
+	for 1 == 1 { drained := 1
+		for drained == 1 { drained = 0
+			select { case <-ack: outstanding = outstanding - 1  drained = 1
+			default: } }
+		if outstanding < burst { grant <- 1
+			outstanding = outstanding + 1
+			sleep(interval_ms) }
+		if outstanding >= burst { sleep(interval_ms) } } }
+
+// seed_handshake is the RESPONDER side: the peer speaks first, and we only
+// answer once we know it is asking for a swarm we actually serve.
+func seed_handshake(fd, infohash, peerid) (buf, ok) { buf = bytes("")  ok = 0
+	b, got := fill(fd, bytes(""), 68)
+	if got == 0 { return buf, ok }
+	if rd8(b, 0) != 19 { return buf, ok }
+	if to_hex(bytes_sub(b, 28, 48)) != infohash { return buf, ok }
+	if write_bytes(fd, from_hex("13" + to_hex(bytes("BitTorrent protocol")) + "0000000000100000" + infohash + peerid)) < 68 { return buf, ok }
+	buf = bytes_sub(b, 68, len(b))
+	ok = 1 }
+
+// have_bitfield renders the have-set as a bitfield payload, MSB first.
+func have_bitfield(have) (bf) { n := len(have)
+	nb := (n + 7) / 8
+	h := ""
+	i := 0
+	for i < nb { v := 0
+		k := 0
+		mask := 128
+		for k < 8 { idx := i * 8 + k
+			if idx < n { if have[idx] == 1 { v = v + mask } }
+			mask = mask / 2
+			k = k + 1 }
+		h = h + hex_of_byte(v)
+		i = i + 1 }
+	bf = from_hex(h) }
+
+// seed_peer serves one leecher for the life of its connection.
+func seed_peer(fd, t, dir, peerid, bfhex, grant, ack, limited, stats, maxblock) { who := peer_addr(fd)
+	socket_timeout(fd, 30000)
+	buf, ok := seed_handshake(fd, t.infohash, peerid)
+	if ok == 0 { close(fd)  stats <- json(SeedStat{kind: "reject", peer: who, bytes: 0, piece: 0 - 1})  return }
+	bf := from_hex(bfhex)
+	write_bytes(fd, bytes_concat(from_hex(be32_hex(1 + len(bf)) + "05"), bf))
+	write_bytes(fd, msg_simple(1))
+	stats <- json(SeedStat{kind: "connect", peer: who, bytes: 0, piece: 0 - 1})
+	sent := 0
+	for 1 == 1 { f := peer_msg(fd, buf)
+		buf = f.buf
+		if f.ok == 0 { close(fd)  stats <- json(SeedStat{kind: "bye", peer: who, bytes: sent, piece: 0 - 1})  return }
+		if f.id == 6 { idx := rd32(f.payload, 0)
+			begin := rd32(f.payload, 4)
+			length := rd32(f.payload, 8)
+			// refuse absurd requests rather than allocate for them
+			if length <= 0 { close(fd)  stats <- json(SeedStat{kind: "bye", peer: who, bytes: sent, piece: 0 - 1})  return }
+			if length > maxblock { close(fd)  stats <- json(SeedStat{kind: "bye", peer: who, bytes: sent, piece: 0 - 1})  return }
+			if bitfield_has(bf, idx) == 1 { if limited == 1 { <-grant }
+				off := idx * t.piecelen + begin
+				blk := store_read_range(t, dir, off, off + length)
+				if len(blk) == length { write_bytes(fd, bytes_concat(from_hex(be32_hex(9 + length) + "07" + be32_hex(idx) + be32_hex(begin)), blk))
+					sent = sent + length
+					stats <- json(SeedStat{kind: "block", peer: who, bytes: length, piece: idx}) }
+				if limited == 1 { ack <- 1 } } } } }
+
+// seed_serve listens and serves until the deadline. Returns totals; progress
+// goes to stderr so stdout stays one JSON object.
+func seed_serve(t, dir, port, uplimit_kbs, duration_ms, peerid, progress) (up, peers, err) { up = 0  peers = 0  err = ""
+	have := store_scan(t, dir)
+	nhave := 0
+	i := 0
+	for i < len(have) { if have[i] == 1 { nhave = nhave + 1 }  i = i + 1 }
+	if nhave == 0 { err = "nothing to seed: no verified pieces in " + dir  return up, peers, err }
+	srv := listen(port)
+	if srv < 0 { err = "cannot bind port " + str(port)  return up, peers, err }
+	bfhex := to_hex(have_bitfield(have))
+	stats := make(chan string)
+	grant := make(chan int)
+	ack := make(chan int)
+	limited := 0
+	if uplimit_kbs > 0 { limited = 1
+		// one grant per 16 KiB block; burst of 4 blocks keeps a fast peer smooth
+		// without letting an idle minute cash in later
+		interval := (BLOCK * 1000) / (uplimit_kbs * 1024)
+		if interval < 1 { interval = 1 }
+		go pacer(grant, ack, interval, 4) }
+	if progress == 1 { eprint("essaim: seeding " + t.name + " -- " + str(nhave) + "/" + str(t.npieces) + " pieces on port " + str(port))
+		if limited == 1 { eprint("essaim: upload capped at " + str(uplimit_kbs) + " KB/s (global)") }
+		if limited == 0 { eprint("essaim: upload uncapped") } }
+	go seed_accept(srv, t, dir, peerid, bfhex, grant, ack, limited, stats)
+	t0 := now_ms()
+	lastreport := t0
+	for now_ms() - t0 < duration_ms { drained := 1
+		for drained == 1 { drained = 0
+			select { case m := <-stats: drained = 1
+				s := parse(m, SeedStat{})
+				if s.kind == "connect" { peers = peers + 1
+					if progress == 1 { eprint("essaim: peer " + s.peer + " connected") } }
+				if s.kind == "block" { up = up + s.bytes }
+				if s.kind == "bye" { if progress == 1 { eprint("essaim: peer " + s.peer + " gone after " + str(s.bytes) + " bytes") } }
+			default: } }
+		if progress == 1 { if now_ms() - lastreport > 10000 { lastreport = now_ms()
+				eprint("essaim: uploaded " + str(up) + " bytes to " + str(peers) + " peers") } }
+		sleep(100) }
+	close(srv) }
+
+func seed_accept(srv, t, dir, peerid, bfhex, grant, ack, limited, stats) { for 1 == 1 { fd := accept(srv)
+		if fd < 0 { return }
+		go seed_peer(fd, t, dir, peerid, bfhex, grant, ack, limited, stats, 131072) } }
+
+// seed_announce tells the trackers we are a seeder listening on `port`, so
+// leechers can find us. left=0 is what marks us complete.
+func seed_announce(t, peerid, port, timeout, progress) (n) { n = 0
+	i := 0
+	for i < len(t.announce) { a := tracker_announce(t.announce[i], t.infohash, peerid, port, 0, timeout)
+		if a.ok == 1 { n = n + 1
+			if progress == 1 { eprint("essaim: announced to " + t.announce[i]) } }
+		if a.ok == 0 { if progress == 1 { eprint("essaim: " + t.announce[i] + " -> " + a.err) } }
+		i = i + 1 } }

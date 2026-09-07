@@ -92,9 +92,36 @@ there is a daemon:
 essaim daemon start                                  # loopback, idempotent
 essaim add "magnet:?xt=urn:btih:…" --dir ./dl --seed # returns an id immediately
 essaim status                                        # poll; JSON, one row per torrent
+essaim set <id> --no-seed --up-limit 512             # adjust a torrent in place
 essaim rm <id>
 essaim daemon stop
 ```
+
+`set` exists because the control plane could create and destroy a torrent but
+not change one: `seed` and `up_limit` were fixed at `add` time, so altering a
+single integer meant `rm` + `add`, which threw away the record and re-resolved
+the metadata. It patches only the fields you pass, so `set --seed` never
+silently resets an upload cap.
+
+### Stopping at a ratio
+
+`--up-limit` bounds the **rate** and never ends. A ratio is the thing that
+ends it:
+
+```sh
+essaim add "magnet:…" --dir ./dl --seed --ratio-pct 150   # stop after uploading 1.5x
+essaim set <id> --ratio-pct 50                            # or change your mind later
+```
+
+It is expressed in **percent of what you downloaded** — `50` is 0.5x, `200` is
+2x, `0` never stops — because there are no floats here and percent is what the
+number means to a person.
+
+The ratio is checked in two places, after every pump *and* before starting a
+seeder, because a limit that only stopped a running seeder would be undone by
+the next loop restarting it. Your `seed` flag stays your intent; the ratio is
+what decides whether it is acted on, so "I asked to seed" and "it has finished
+seeding" remain two different facts.
 
 It is **single-actor**: one loop owns the job table and handles each request
 inline, so there is no lock and no second writer. That isn't caution for its own

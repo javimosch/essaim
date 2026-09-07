@@ -23,6 +23,28 @@ func main() { home := "/tmp/essaim-daemon-test"
 	expect("token-open", str(token_ok("{}", "")), "1")
 	expect("token-good", str(token_ok("{\"token\":\"s3cret\"}", "s3cret")), "1")
 	expect("token-bad", str(token_ok("{\"token\":\"nope\"}", "s3cret")), "0")
+	// parse_flag: the daemon reads seed as an int and writes it as a bool, so
+	// a client that round-trips a record posts back the bool it was given.
+	expect("flag-true", str(parse_flag("true")), "1")
+	expect("flag-false", str(parse_flag("false")), "0")
+	expect("flag-one", str(parse_flag("1")), "1")
+	expect("flag-zero", str(parse_flag("0")), "0")
+	expect("flag-empty", str(parse_flag("")), "0")
+	// ratio_done decides when a seeder has served its share. It is checked
+	// after every pump AND before starting one, so a torrent that already met
+	// its ratio does not restart seeding on the next loop.
+	expect("ratio-off-by-default", str(ratio_done(Rec{ratio_pct: 0, bytes: 100, uploaded: 999})), "0")
+	expect("ratio-not-yet", str(ratio_done(Rec{ratio_pct: 50, bytes: 100, uploaded: 49})), "0")
+	expect("ratio-exactly-met", str(ratio_done(Rec{ratio_pct: 50, bytes: 100, uploaded: 50})), "1")
+	expect("ratio-exceeded", str(ratio_done(Rec{ratio_pct: 50, bytes: 100, uploaded: 51})), "1")
+	expect("ratio-2x", str(ratio_done(Rec{ratio_pct: 200, bytes: 100, uploaded: 199})), "0")
+	expect("ratio-2x-met", str(ratio_done(Rec{ratio_pct: 200, bytes: 100, uploaded: 200})), "1")
+	// nothing downloaded yet means no denominator: never stop on a ratio of
+	// something over zero.
+	expect("ratio-no-bytes", str(ratio_done(Rec{ratio_pct: 50, bytes: 0, uploaded: 10})), "0")
+	// a real torrent's numbers, to prove the arithmetic does not overflow
+	expect("ratio-large", str(ratio_done(Rec{ratio_pct: 50, bytes: 276445467, uploaded: 138222733})), "0")
+	expect("ratio-large-met", str(ratio_done(Rec{ratio_pct: 50, bytes: 276445467, uploaded: 138222734})), "1")
 	expect("token-missing", str(token_ok("{}", "s3cret")), "0")
 	// record indexing and removal keep the three parallel tables aligned
 	rs := []Rec{Rec{id: "a"}, Rec{id: "b"}, Rec{id: "c"}}

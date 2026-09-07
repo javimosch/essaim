@@ -33,6 +33,7 @@ func main() { a := args()
 	if cmd == "add" { cmd_add(a) }
 	if cmd == "status" { cmd_ls(a) }
 	if cmd == "rm" { cmd_rm(a) }
+	if cmd == "set" { cmd_set(a) }
 	if cmd == "install" { cmd_install(a) }
 	if cmd == "uninstall" { cmd_uninstall(a) }
 	if cmd == "update" { cmd_update(a) }

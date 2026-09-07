@@ -67,13 +67,39 @@ func daemon_probe(url) (up, body) { up = 0  body = "{}"
 
 // ---- the agent-facing verbs ----
 
+// cmd_set is the CLI face of PATCH /torrents/{id}. Without it the only way to
+// change a running torrent would be an HTTP call, and everything else the
+// daemon does has a command.
+func cmd_set(a) { id := arg_at(a, 2)
+	if id == "" { fail(EXIT_ARGS, "missing_argument", "set needs a torrent id", []string{"essaim status", "essaim set <id> --seed --up-limit 500"}) }
+	url := daemon_url(a)
+	up, _ := daemon_probe(url)
+	if up == 0 { fail(EXIT_VALIDATION, "daemon_not_running", "no daemon is answering at " + url, []string{"essaim daemon start"}) }
+	fields := []string{}
+	// Only what was asked for is sent: an absent field is left alone by the
+	// daemon, so `set --seed` must not quietly reset an upload cap.
+	if flag_on(a, "--seed") == 1 { fields = append(fields, "\"seed\":1") }
+	if flag_on(a, "--no-seed") == 1 { fields = append(fields, "\"seed\":0") }
+	uv := flag_val(a, "--up-limit", "")
+	if uv != "" { fields = append(fields, "\"up_limit\":" + uv) }
+	rv := flag_val(a, "--ratio-pct", "")
+	if rv != "" { fields = append(fields, "\"ratio_limit_pct\":" + rv) }
+	if len(fields) == 0 { fail(EXIT_ARGS, "nothing_to_set", "give at least one of --seed, --no-seed, --up-limit, --ratio-pct", []string{"essaim set <id> --no-seed"}) }
+	st, b, err := http_do_b("PATCH", url + "/torrents/" + id, "{" + join(fields, ",") + "}", auth_header(a), 20000)
+	if err != "" { fail(EXIT_NETWORK, "daemon_unreachable", err, []string{}) }
+	if st == 404 { fail(EXIT_NOTFOUND, "not_found", "no torrent with id " + id, []string{"essaim status"}) }
+	if st != 200 { fail(EXIT_EXTERNAL, "set_failed", bytes_str(b), []string{}) }
+	println(bytes_str(b))
+	flush()
+	exit(EXIT_OK) }
+
 func cmd_add(a) { src := arg_at(a, 2)
 	if src == "" { fail(EXIT_ARGS, "missing_argument", "add needs a magnet, .torrent path, or url", []string{"essaim add \"magnet:?xt=urn:btih:...\" --dir ./dl"}) }
 	url := daemon_url(a)
 	up, _ := daemon_probe(url)
 	if up == 0 { fail(EXIT_VALIDATION, "daemon_not_running", "no daemon is answering at " + url, []string{"essaim daemon start", "or use `essaim get` to download in the foreground"}) }
 	seed := flag_on(a, "--seed")
-	body := "{\"source\":\"" + jesc(src) + "\",\"dir\":\"" + jesc(flag_val(a, "--dir", ".")) + "\",\"seed\":" + str(seed) + ",\"up_limit\":" + flag_val(a, "--up-limit", "0") + "}"
+	body := "{\"source\":\"" + jesc(src) + "\",\"dir\":\"" + jesc(flag_val(a, "--dir", ".")) + "\",\"seed\":" + str(seed) + ",\"up_limit\":" + flag_val(a, "--up-limit", "0") + ",\"ratio_limit_pct\":" + flag_val(a, "--ratio-pct", "0") + "}"
 	st, b, err := http_do_b("POST", url + "/torrents", body, auth_header(a), 20000)
 	if err != "" { fail(EXIT_NETWORK, "daemon_unreachable", err, []string{}) }
 	if st != 200 { fail(EXIT_EXTERNAL, "add_failed", bytes_str(b), []string{}) }

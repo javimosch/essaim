@@ -71,11 +71,19 @@ func seed_peer(fd, t, dir, peerid, bfhex, grant, ack, limited, stats, maxblock) 
 			// refuse absurd requests rather than allocate for them
 			if length <= 0 { close(fd)  stats <- json(SeedStat{kind: "bye", peer: who, bytes: sent, piece: 0 - 1})  return }
 			if length > maxblock { close(fd)  stats <- json(SeedStat{kind: "bye", peer: who, bytes: sent, piece: 0 - 1})  return }
+			// The block is read, written to the socket and finished with, but
+			// this goroutine lives as long as the peer does -- and an arena is
+			// only reclaimed when its goroutine RETURNS. Without the block a
+			// peer served for an hour retains every byte it was ever sent.
+			// The stats send stays OUTSIDE it: what goes down a channel
+			// outlives the arena it was built in.
 			if bitfield_has(bf, idx) == 1 { if limited == 1 { <-grant }
 				off := idx * t.piecelen + begin
-				blk := store_read_range(t, dir, off, off + length)
-				if len(blk) == length { write_bytes(fd, bytes_concat(from_hex(be32_hex(9 + length) + "07" + be32_hex(idx) + be32_hex(begin)), blk))
-					sent = sent + length
+				served := 0
+				arena { blk := store_read_range(t, dir, off, off + length)
+					if len(blk) == length { write_bytes(fd, bytes_concat(from_hex(be32_hex(9 + length) + "07" + be32_hex(idx) + be32_hex(begin)), blk))
+						served = 1 } }
+				if served == 1 { sent = sent + length
 					stats <- json(SeedStat{kind: "block", peer: who, bytes: length, piece: idx}) }
 				if limited == 1 { ack <- 1 } } } } }
 

@@ -28,9 +28,16 @@ func store_write_piece(t, dir, idx, data) (n) { n = 0
 		i = i + 1 } }
 
 // store_read_range reads an arbitrary byte range of the torrent's flat stream,
-// reassembling it across whatever files it spans. Serving a peer means answering
-// 16 KiB block requests, and reading a whole 1 MiB piece to satisfy each one
-// would re-read the same piece 64 times.
+// reassembling it across whatever files it spans.
+//
+// It reads ONLY the range, with a positional read. Doing it the obvious way --
+// read_file_bytes the file, then slice -- costs a copy of the WHOLE file per
+// call, which makes every caller here quadratic: store_scan asks for one piece
+// at a time, so verifying a 264 MB torrent with 1055 pieces read 264 MB a
+// thousand times over (~279 GB) and the daemon was OOM-killed within seconds of
+// a completed download. Seeding was the same shape per 16 KiB block. read_file_at
+// did not exist in machin when this was first written; it does now, and this is
+// what it is for.
 func store_read_range(t, dir, start, stop) (data) { data = bytes("")
 	i := 0
 	for i < len(t.files) { f := t.files[i]
@@ -38,11 +45,10 @@ func store_read_range(t, dir, start, stop) (data) { data = bytes("")
 		if f.offset > lo { lo = f.offset }
 		hi := stop
 		if f.offset + f.length < hi { hi = f.offset + f.length }
-		if lo < hi { whole := read_file_bytes(dir + "/" + f.path)
-			a := lo - f.offset
-			b := hi - f.offset
-			if b > len(whole) { data = bytes("")  return data }
-			data = bytes_concat(data, bytes_sub(whole, a, b)) }
+		if lo < hi { part := read_file_at(dir + "/" + f.path, lo - f.offset, hi - lo)
+			// a short read means the file is truncated: the range is not there
+			if len(part) != hi - lo { data = bytes("")  return data }
+			data = bytes_concat(data, part) }
 		i = i + 1 } }
 
 // store_read_piece reads a piece back off disk. Used to re-verify on resume:
@@ -58,11 +64,17 @@ func piece_ok(t, idx, data) (ok) { ok = 0
 
 // store_scan re-verifies everything on disk and returns the have-set, so an
 // interrupted download resumes instead of restarting.
+// A piece buffer is read, hashed and thrown away, but the arena of the goroutine
+// doing the scanning is not reclaimed until that goroutine RETURNS -- and the
+// daemon's scanning goroutine is its main loop, which never returns. Scanning
+// 1055 pieces therefore retained ~1 GB for a 264 MB torrent, and would still
+// OOM on a big one. The piece never escapes the iteration, so an arena block
+// hands each one back at the closing brace and peak memory stays flat.
 func store_scan(t, dir) (have) { have = []int{}
 	i := 0
 	for i < t.npieces { h := 0
-		d := store_read_piece(t, dir, i)
-		if len(d) > 0 { if piece_ok(t, i, d) == 1 { h = 1 } }
+		arena { d := store_read_piece(t, dir, i)
+			if len(d) > 0 { if piece_ok(t, i, d) == 1 { h = 1 } } }
 		have = append(have, h)
 		i = i + 1 } }
 

@@ -129,10 +129,11 @@ asked for. The figures sit *below* the cap because `bytes` counts only
 that has not finished a piece yet.
 
 Unlike the other three, a change to `--down-limit` applies **the next time the
-torrent starts**, not immediately: the pacer takes its interval when the job
-starts, and restarting a running job from the control loop would mean sending
-on an unbuffered channel to workers that may be parked — which hangs the
-supervisor. That was tried, and it froze the whole daemon.
+torrent starts**. The pacer takes its interval when the job starts, and
+restarting a healthy download to apply a new one throws away its peers — the
+resolver then has to find them again, which on an intermittent swarm can leave
+the torrent sitting in `resolving` for minutes. Trading a working download for
+a faster-applied speed limit is a bad deal.
 
 ### Stopping at a ratio
 

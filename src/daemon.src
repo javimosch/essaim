@@ -237,18 +237,22 @@ func daemon_serve(host, port, token, tick, peerport, timeout, progress) (err) { 
 							if pratio != "" { recs[k].ratio_pct = parse_int(pratio) }
 							// A download pacer takes its interval when the job
 							// starts, so a new cap applies the next time the
-							// torrent starts -- on the next daemon start, or
-							// after rm + add.
+							// torrent starts.
 							//
-							// It deliberately does NOT restart the job here.
-							// job_stop sends one -1 per worker on an UNBUFFERED
-							// channel, and a worker parked on a socket read or
-							// waiting for a grant is not there to receive it --
-							// which blocks the single-actor loop that owns
-							// every torrent. Tried it; it hung the whole
-							// daemon. Making a control-plane call able to
-							// freeze the supervisor is a far worse bug than a
-							// cap that waits for a restart.
+							// Restarting the job here to apply it sooner was
+							// tried and rejected -- but NOT for the reason you
+							// might expect. MFL channel sends do not block:
+							// they queue, verified with 100k sends to a channel
+							// nobody was reading. So job_stop cannot stall this
+							// loop, and there is no deadlock to avoid.
+							//
+							// The real cost is the restart itself. Stopping a
+							// healthy download throws away its peers, and the
+							// resolver has to find them again -- on an
+							// intermittent swarm that took minutes and left the
+							// torrent sitting in "resolving". Trading a working
+							// download for a faster-applied speed limit is a
+							// bad deal, so the cap waits.
 							if pdown != "" { recs[k].down_limit = parse_int(pdown) }
 							// A running seeder holds its cap from when it
 							// started, so any change to seeding means stopping

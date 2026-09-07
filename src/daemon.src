@@ -319,12 +319,34 @@ func daemon_serve(host, port, token, tick, peerport, timeout, progress) (err) { 
 			// The seed flag stays the user's intent; ratio_done is what
 			// stops it being acted on, so "I asked to seed" and "it has
 			// finished seeding" remain two different facts.
-			if recs[i].state == "complete" { if recs[i].seed == 1 { if ratio_done(recs[i]) == 0 { if seeders[i].active == 0 { if seeders[i].srv == 0 - 1 { t := torrent_parse(read_file_bytes(torrent_cache(recs[i].infohash)))
-								if t.ok == 1 { sd, serr := seed_start(t, recs[i].dir, peerport, recs[i].up_limit, pid)
+			// A FAILED seed_start used to be retried on every tick, because
+			// its result (active==0, srv==-1) is this very condition. Each
+			// retry re-read and re-verified the torrent on the main loop,
+			// whose arena is never reclaimed, so a daemon that could not bind
+			// its peer port grew ~1.8 MB/s until it was killed. The usual way
+			// in was a cap change: seed_stop could not free the port, so the
+			// rebind failed and never stopped failing. Back off instead, and
+			// keep the delay in the Seeder so a fresh struct from seed_start
+			// does not reset it.
+			if recs[i].state == "complete" { if recs[i].seed == 1 { if ratio_done(recs[i]) == 0 { if seeders[i].active == 0 { if seeders[i].srv == 0 - 1 { if now_ms() >= seeders[i].retry_at { // The job already holds the parsed torrent, so re-reading and
+								// re-parsing the cache file here cost ~930 kB of main-loop arena
+								// per attempt -- which a retrying seeder paid over and over.
+								t := jobs[i].t
+								if t.ok == 0 { t = torrent_parse(read_file_bytes(torrent_cache(recs[i].infohash))) }
+								if t.ok == 1 { wait := seeders[i].retry_ms
+									sd, serr := seed_start(t, recs[i].dir, peerport, recs[i].up_limit, pid)
 									seeders[i] = sd
 									if serr == "" { recs[i].state = "seeding"
+										recs[i].err = ""
 										if progress == 1 { eprint("essaim: seeding " + recs[i].name) } }
-									if serr != "" { recs[i].err = serr } } } } } } }
+									if serr != "" { recs[i].err = serr
+										// 1s on the first failure, doubling to a 60s ceiling
+										next := 1000
+										if wait > 0 { next = wait * 2 }
+										if next > 60000 { next = 60000 }
+										seeders[i].retry_ms = next
+										seeders[i].retry_at = now_ms() + next
+										if progress == 1 { eprint("essaim: " + serr + " -- retrying in " + str(next / 1000) + "s") } } } } } } } } }
 			i = i + 1 } }
 	close(srv)
 	registry_save(recs)

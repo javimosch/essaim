@@ -93,24 +93,43 @@ func seed_peer(fd, t, dir, peerid, bfhex, grant, ack, limited, stats, maxblock) 
 // goroutines have reported. seed_serve is then a pump loop, so the daemon and
 // the foreground command share one implementation.
 
-type Seeder struct { srv int  stats chan string  grant chan int  ack chan int  limited int  up int  peers int  active int  port int  uplimit int }
+// stop is how seed_stop reaches the accept goroutine. Closing the listening fd
+// from another goroutine does NOT wake a blocked accept(), so the socket stayed
+// alive for the life of the process and the port could never be rebound --
+// which turned every cap change into a permanent "cannot bind" state. The
+// listener now has a timeout, so accept() returns regularly and can notice.
+//
+// retry_at/retry_ms back off a FAILED seed_start. Without them a failure left
+// active==0 and srv==-1, which is exactly the pump's restart condition, so the
+// daemon retried every tick forever and its main-loop arena grew ~1.8 MB/s.
+type Seeder struct { srv int  stats chan string  grant chan int  ack chan int  limited int  up int  peers int  active int  port int  uplimit int  stop chan int  retry_at int  retry_ms int }
 
-func seed_start(t, dir, port, uplimit_kbs, peerid) (sd, err) { sd = Seeder{srv: 0 - 1, stats: make(chan string), grant: make(chan int), ack: make(chan int), limited: 0, up: 0, peers: 0, active: 0, port: port, uplimit: uplimit_kbs}
+func seed_start(t, dir, port, uplimit_kbs, peerid) (sd, err) { sd = Seeder{srv: 0 - 1, stats: make(chan string), grant: make(chan int), ack: make(chan int), limited: 0, up: 0, peers: 0, active: 0, port: port, uplimit: uplimit_kbs, stop: make(chan int), retry_at: 0, retry_ms: 0}
 	err = ""
+	// Bind BEFORE scanning. The scan re-verifies every piece on disk, so doing
+	// it first meant a doomed retry re-read the whole torrent just to fail on
+	// the port a moment later -- and the daemon retries on its main loop, whose
+	// arena is never reclaimed, so that cost accumulated. Claiming the port
+	// first makes a failed start nearly free.
+	sd.srv = listen(port)
+	if sd.srv < 0 { err = "cannot bind port " + str(port)  return sd, err }
+	// accept() must come up for air so the acceptor can see a stop
+	socket_timeout(sd.srv, 500)
 	have := store_scan(t, dir)
 	nhave := 0
 	i := 0
 	for i < len(have) { if have[i] == 1 { nhave = nhave + 1 }  i = i + 1 }
-	if nhave == 0 { err = "nothing to seed: no verified pieces in " + dir  return sd, err }
-	sd.srv = listen(port)
-	if sd.srv < 0 { err = "cannot bind port " + str(port)  return sd, err }
+	// nothing to serve: hand the port back rather than sitting on it
+	if nhave == 0 { close(sd.srv)  sd.srv = 0 - 1
+		err = "nothing to seed: no verified pieces in " + dir
+		return sd, err }
 	if uplimit_kbs > 0 { sd.limited = 1
 		// one grant per 16 KiB block; a burst of 4 keeps a fast peer smooth
 		// without letting an idle minute be cashed in later
 		interval := (BLOCK * 1000) / (uplimit_kbs * 1024)
 		if interval < 1 { interval = 1 }
 		go pacer(sd.grant, sd.ack, interval, 4) }
-	go seed_accept(sd.srv, t, dir, peerid, to_hex(have_bitfield(have)), sd.grant, sd.ack, sd.limited, sd.stats)
+	go seed_accept(sd.srv, t, dir, peerid, to_hex(have_bitfield(have)), sd.grant, sd.ack, sd.limited, sd.stats, sd.stop)
 	sd.active = 1 }
 
 func seed_pump(sd, progress) (out) { out = sd
@@ -125,8 +144,13 @@ func seed_pump(sd, progress) (out) { out = sd
 			if st.kind == "bye" { if progress == 1 { eprint("essaim: peer " + st.peer + " gone after " + str(st.bytes) + " bytes") } }
 		default: } } }
 
+// seed_stop asks the acceptor to shut down; it does NOT close the fd itself.
+// The acceptor owns the listening socket and closes it once it observes the
+// stop, which is the only way the port is actually released. That takes up to
+// one accept timeout, so a caller rebinding the same port immediately can still
+// lose the race -- which is what the pump's backoff is for.
 func seed_stop(sd) (out) { out = sd
-	if out.active == 1 { close(out.srv)  out.active = 0 } }
+	if out.active == 1 { out.stop <- 1  out.active = 0 } }
 
 // seed_serve is the blocking form used by `essaim seed`.
 func seed_serve(t, dir, port, uplimit_kbs, duration_ms, peerid, progress) (up, peers, err) { up = 0  peers = 0
@@ -150,9 +174,16 @@ func seed_serve(t, dir, port, uplimit_kbs, duration_ms, peerid, progress) (up, p
 	peers = sd.peers
 	sd = seed_stop(sd) }
 
-func seed_accept(srv, t, dir, peerid, bfhex, grant, ack, limited, stats) { for 1 == 1 { fd := accept(srv)
-		if fd < 0 { return }
-		go seed_peer(fd, t, dir, peerid, bfhex, grant, ack, limited, stats, 131072) } }
+// A negative fd is USUALLY just the accept timeout, not a reason to stop -- the
+// old code returned on it, so adding a timeout without this would have ended
+// seeding after half a second. Only an explicit stop ends the loop, and the
+// close happens here because this goroutine is what keeps the socket alive.
+func seed_accept(srv, t, dir, peerid, bfhex, grant, ack, limited, stats, stop) { for 1 == 1 { fd := accept(srv)
+		if fd >= 0 { go seed_peer(fd, t, dir, peerid, bfhex, grant, ack, limited, stats, 131072) }
+		if fd < 0 { halt := 0
+			select { case <-stop: halt = 1
+			default: }
+			if halt == 1 { close(srv)  return } } } }
 
 // seed_announce tells the trackers we are a seeder listening on `port`, so
 // leechers can find us. left=0 is what marks us complete.

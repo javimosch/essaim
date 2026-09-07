@@ -52,6 +52,24 @@ always equals `error.code` in the body.
 - `machin build --race-safe` passes: engine, seeder **and daemon** are all
   **proved** data-race free
 
+## A browser UI, if a human is watching
+
+essaim is agent-first and that is the point — but a person looking at a
+download queue would usually rather see it than read JSON.
+[**essaim-ui**](https://github.com/javimosch/essaim-ui) is one static binary
+that drives this daemon's HTTP API from a browser: add by magnet, per-torrent
+upload and download caps, a stop-at ratio, the full path on disk, and
+remove-with-data.
+
+```sh
+curl -fsSL -o essaim-ui https://github.com/javimosch/essaim-ui/releases/latest/download/essaim-ui-linux-amd64
+chmod +x essaim-ui && mv essaim-ui ~/.local/bin/
+```
+
+It is a separate program and no part of essaim depends on it. It is also
+mentioned in `essaim guide`, so an agent driving this daemon can offer it to
+the human it is working for rather than leaving them reading JSON.
+
 ## Search sources
 
 Sources are **config rows, not code** — adding one is a table entry in

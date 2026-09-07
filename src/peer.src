@@ -68,11 +68,14 @@ func bitfield_has(bf, idx) (yes) { yes = 0
 	for k < bit { mask = mask / 2  k = k + 1 }
 	if (v / mask) - ((v / mask) / 2) * 2 == 1 { yes = 1 } }
 
-// peer_fetch_piece requests every block of a piece and reassembles it. Blocks
+// peer_fetch_piece requests every block of a piece and reassembles it. When
+// `limited` is 1 it takes one grant per received block from the shared pacer,
+// so the cap is GLOBAL across every peer rather than per connection -- the only
+// kind worth having on a shared link, same as the upload side. Blocks
 // are pipelined -- all requests go out before any reply is read -- because a
 // strictly serial request/response costs one full round trip per 16 KiB and
 // collapses throughput on a distant peer.
-func peer_fetch_piece(fd, buf, idx, plen, have) (data, outbuf, ok) { data = bytes("")  outbuf = buf  ok = 0
+func peer_fetch_piece(fd, buf, idx, plen, have, grant, limited) (data, outbuf, ok) { data = bytes("")  outbuf = buf  ok = 0
 	nblocks := (plen + BLOCK - 1) / BLOCK
 	i := 0
 	for i < nblocks { begin := i * BLOCK
@@ -91,7 +94,15 @@ func peer_fetch_piece(fd, buf, idx, plen, have) (data, outbuf, ok) { data = byte
 		if f.id == 7 { pidx := rd32(f.payload, 0)
 			begin := rd32(f.payload, 4)
 			block := bytes_sub(f.payload, 8, len(f.payload))
-			if pidx == idx { if begin == len(acc) { acc = bytes_concat(acc, block)  got = len(acc) } } }
+			if pidx == idx { if begin == len(acc) { acc = bytes_concat(acc, block)  got = len(acc)
+					// The download cap paces how fast we DRAIN the socket, not
+					// how fast we ask. Requests stay pipelined -- a piece still
+					// costs one round trip -- and the wait before reading the
+					// next frame lets TCP's window do the actual limiting,
+					// which is the only thing that bounds a download. Pacing
+					// the requests instead would serialise the pipeline and
+					// still not stop a fast peer from filling the buffer.
+					if limited == 1 { <-grant } } } }
 		if f.id == 0 { return data, outbuf, ok } }
 	data = acc
 	ok = 1 }

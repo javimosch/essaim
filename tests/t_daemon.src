@@ -90,6 +90,27 @@ func main() { home := "/tmp/essaim-daemon-test"
 	stg, bg, _ := http_get_b(base + "/torrents/" + id, 2000)
 	expect("get-one", str(stg), "200")
 	expect("bad-source-errors", unq(jget(bytes_str(bg), ".torrent.state")), "error")
+	// PATCH adjusts in place. This record's job is not active (the source did
+	// not resolve), so the down_limit restart branch stays out of the way and
+	// what is under test here is purely the field merge.
+	stp404, _, _ := http_do_b("PATCH", base + "/torrents/nosuchid", "{\"seed\":1}", "", 2000)
+	expect("patch-unknown-404", str(stp404), "404")
+	stp, bp, _ := http_do_b("PATCH", base + "/torrents/" + id, "{\"seed\":1,\"up_limit\":512,\"down_limit\":256,\"ratio_limit_pct\":150}", "", 3000)
+	expect("patch-status", str(stp), "200")
+	expect("patch-seed", unq(jget(bytes_str(bp), ".torrent.seed")), "true")
+	expect("patch-up", jget(bytes_str(bp), ".torrent.up_limit_kbs"), "512")
+	expect("patch-down", jget(bytes_str(bp), ".torrent.down_limit_kbs"), "256")
+	expect("patch-ratio", jget(bytes_str(bp), ".torrent.ratio_limit_pct"), "150")
+	// the claim worth pinning: a PATCH touches ONLY the fields it carries, so
+	// changing one number never silently resets the others
+	stq, bq, _ := http_do_b("PATCH", base + "/torrents/" + id, "{\"ratio_limit_pct\":200}", "", 3000)
+	expect("patch2-status", str(stq), "200")
+	expect("patch2-ratio-changed", jget(bytes_str(bq), ".torrent.ratio_limit_pct"), "200")
+	expect("patch2-up-kept", jget(bytes_str(bq), ".torrent.up_limit_kbs"), "512")
+	expect("patch2-down-kept", jget(bytes_str(bq), ".torrent.down_limit_kbs"), "256")
+	expect("patch2-seed-kept", unq(jget(bytes_str(bq), ".torrent.seed")), "true")
+	// and it is durable: the registry on disk carries the patched values
+	expect("patch-persisted", str(contains(read_file(state_path()), "\"down_limit\":256")), "true")
 	// shutdown is token-gated
 	stx, _, _ := http_post_b(base + "/_shutdown", "{\"token\":\"wrong\"}", 2000)
 	expect("shutdown-rejects", str(stx), "401")

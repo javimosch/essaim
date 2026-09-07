@@ -98,9 +98,9 @@ essaim daemon stop
 ```
 
 `set` exists because the control plane could create and destroy a torrent but
-not change one: `seed` and `up_limit` were fixed at `add` time, so altering a
-single integer meant `rm` + `add`, which threw away the record and re-resolved
-the metadata. It patches only the fields you pass, so `set --seed` never
+not change one: `seed`, `up_limit` and `down_limit` were fixed at `add` time, so
+altering a single integer meant `rm` + `add`, which threw away the record and
+re-resolved the metadata. It patches only the fields you pass, so `set --seed` never
 silently resets an upload cap.
 
 ### Stopping at a ratio
@@ -173,6 +173,27 @@ connection, not a per-peer limit. A burst of up to 4 blocks is allowed, so a ver
 short transfer can measure a few percent over the cap; over any real duration it
 converges.
 
+### Capping the download too
+
+`--down-limit` is the mirror image, in the same units and with the same global
+shape:
+
+```sh
+essaim get ./file.torrent --dir ./dl --down-limit 500   # leave the link usable
+essaim add "magnet:…" --dir ./dl --down-limit 500       # same, under the daemon
+essaim set <id> --down-limit 0                          # 0 means uncapped
+```
+
+It paces how fast blocks are **drained from the socket**, not how fast they are
+requested. Requests stay pipelined, so a piece still costs one round trip, and
+TCP's own backpressure does the limiting. Pacing the requests instead would
+serialise the pipeline — slower for the same cap, and still no bound on a fast
+peer filling the receive buffer.
+
+One caveat: changing `--down-limit` on a **running** torrent restarts peer
+discovery, because a job's pacer is created with its interval when the job
+starts. Setting it at `add` time costs nothing.
+
 Two machines, no tracker and no DHT:
 
 ```sh
@@ -194,6 +215,18 @@ Follows the [cli-specs](https://cli-specs.intrane.fr/) family:
 | cli-feedback-spec | `essaim feedback "…" --kind bug` — dual-write with an idempotency key |
 | cli-telemetry-spec | **deliberately not adopted** (see below) |
 | cli-daemon-spec | `serve` + `/_health` + token-gated `/_shutdown` + `daemon start\|stop\|status`, loopback by default |
+
+Success is `{"ok":true,"version":"…","data":{…}}` and failure is
+`{"ok":false,"version":"…","error":{…}}` with a matching exit code. As of 0.5.0 the
+daemon-backed commands (`add`, `status`, `set`, `rm`) obey this too — before that
+they printed the daemon's raw HTTP reply, so their payload sat at the top level
+instead of under `.data`. Parsing no longer depends on which commands happen to be
+daemon-backed.
+
+Two deliberate exceptions: `guide` puts its payload under `.guide` (that shape is
+cli-guide-spec's, not ours), and a `get` that ends incomplete exits 105 with
+**both** an `error` and a `data` block, because partial progress is still worth
+reporting.
 
 **No telemetry, on purpose.** cli-telemetry-spec §8.1 says a tool that cannot
 satisfy the must-not-send list for its domain should ship none. For a BitTorrent

@@ -20,5 +20,14 @@ for t in tests/t_*.src; do
     echo "===== $t ====="
     machin run "$out" --safe || fail=1
 done
+# the module suites above never touch the built binary, so stdout shape is
+# checked separately -- but only if a binary exists, so `./tests/run.sh` still
+# works on a clean checkout before the first build.
+if [ -x ./essaim ]; then
+    echo; echo "===== tests/cli.sh ====="
+    ./tests/cli.sh || fail=1
+else
+    echo; echo "===== tests/cli.sh ===== SKIPPED (no ./essaim -- run ./build.sh)"
+fi
 [ "$fail" = 0 ] || { echo; echo "SUITE FAILED"; exit 1; }
 echo; echo "SUITE PASSED"

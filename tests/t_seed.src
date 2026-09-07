@@ -58,7 +58,7 @@ func main() { // bitfield rendering, MSB first within each byte
 	done := make(chan string)
 	go serve(t, sdir, 51771, 0, 6000, done)
 	sleep(400)
-	s := engine_download(t, ldir, []Peer{Peer{ip: "127.0.0.1", port: 51771}}, peer_id_new(), 5000, 15000, 0)
+	s := engine_download(t, ldir, []Peer{Peer{ip: "127.0.0.1", port: 51771}}, peer_id_new(), 5000, 15000, 0, 0)
 	expect("xfer-complete", str(s.complete), "1")
 	expect("xfer-pieces", str(s.done), "8")
 	expect("xfer-bytes", str(s.bytes), "131072")
@@ -76,11 +76,27 @@ func main() { // bitfield rendering, MSB first within each byte
 	go serve(t, sdir, 51772, 64, 12000, done2)
 	sleep(400)
 	t0 := now_ms()
-	s2 := engine_download(t, ldir2, []Peer{Peer{ip: "127.0.0.1", port: 51772}}, peer_id_new(), 8000, 20000, 0)
+	s2 := engine_download(t, ldir2, []Peer{Peer{ip: "127.0.0.1", port: 51772}}, peer_id_new(), 8000, 20000, 0, 0)
 	el := now_ms() - t0
 	expect("capped-complete", str(s2.complete), "1")
 	expect("capped-is-slower", str(el >= 700), "true")
 	if el < 700 { println("  (capped transfer took " + str(el) + " ms, expected >= 700)") }
-	system("rm -rf " + sdir + " " + ldir + " " + ldir2)
+	// and the symmetric case: an UNCAPPED seeder, a capped downloader. Same
+	// arithmetic, but the limiter under test is now on the receiving side --
+	// which is the half a user actually controls on their own link.
+	ldir3 := "/tmp/essaim-seed-dst3"
+	system("rm -rf " + ldir3)
+	done3 := make(chan string)
+	go serve(t, sdir, 51773, 0, 12000, done3)
+	sleep(400)
+	t1 := now_ms()
+	s3 := engine_download(t, ldir3, []Peer{Peer{ip: "127.0.0.1", port: 51773}}, peer_id_new(), 8000, 20000, 64, 0)
+	el3 := now_ms() - t1
+	expect("down-capped-complete", str(s3.complete), "1")
+	expect("down-capped-bytes", str(s3.bytes), "131072")
+	expect("down-capped-content", str(file_size(ldir3 + "/big.bin")), "131072")
+	expect("down-capped-is-slower", str(el3 >= 700), "true")
+	if el3 < 700 { println("  (capped download took " + str(el3) + " ms, expected >= 700)") }
+	system("rm -rf " + sdir + " " + ldir + " " + ldir2 + " " + ldir3)
 	if g_fail == 0 { println("\nALL PASS") }
 	if g_fail > 0 { println("\n" + str(g_fail) + " FAILED")  exit(1) } }

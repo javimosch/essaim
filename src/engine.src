@@ -15,7 +15,7 @@ type Res struct { kind string  idx int  ok int  peer string  err string }
 type Stats struct { done int  total int  bytes int  peers_ok int  peers_dead int  elapsed int  complete int }
 
 // peer_worker owns one peer connection for its whole life.
-func peer_worker(host, pport, t, dir, infohash, peerid, work, res, timeout) { who := host + ":" + str(pport)
+func peer_worker(host, pport, t, dir, infohash, peerid, work, res, timeout, grant, limited) { who := host + ":" + str(pport)
 	fd := dial(host, pport)
 	if fd < 0 { res <- json(Res{kind: "gone", idx: 0 - 1, peer: who, err: "connect failed"})  return }
 	socket_timeout(fd, timeout)
@@ -39,7 +39,7 @@ func peer_worker(host, pport, t, dir, infohash, peerid, work, res, timeout) { wh
 	for 1 == 1 { idx := <-work
 		if idx < 0 { close(fd)  return }
 		if bitfield_has(bf, idx) == 0 { res <- json(Res{kind: "nohave", idx: idx, peer: who})  continue }
-		data, nbuf, got := peer_fetch_piece(fd, buf, idx, piece_size(t, idx), 1)
+		data, nbuf, got := peer_fetch_piece(fd, buf, idx, piece_size(t, idx), 1, grant, limited)
 		buf = nbuf
 		if got == 0 { close(fd)  res <- json(Res{kind: "gone", idx: idx, peer: who, err: "dropped mid-piece"})  return }
 		if piece_ok(t, idx, data) == 0 { res <- json(Res{kind: "bad", idx: idx, peer: who, err: "hash mismatch"})  continue }
@@ -71,19 +71,54 @@ func bitfield_set(bf, idx, npieces) (out) { out = bf
 // arrived and returns immediately. The blocking form is then just a pump loop,
 // so there is one implementation of the logic, not two.
 
-type Job struct { id string  dir string  t Torrent  work chan int  res chan string  have []int  live int  nworkers int  nohaves int  s Stats  started int  active int }
+// dgrant is the download pacer's channel, shared by every peer goroutine so the
+// cap is global rather than per connection. It exists even when uncapped,
+// because a struct field cannot be conditionally absent -- dlimited decides
+// whether anybody waits on it.
+type Job struct { id string  dir string  t Torrent  work chan int  res chan string  have []int  live int  nworkers int  nohaves int  s Stats  started int  active int  dgrant chan int  dlimited int  down_limit int }
 
-func job_start(id, t, dir, peers, peerid, timeout) (j) { j = Job{id: id, dir: dir, t: t, work: make(chan int), res: make(chan string), have: []int{}, live: 0, nworkers: 0, nohaves: 0, s: Stats{total: t.npieces}, started: now_ms(), active: 1}
+// dpacer issues one grant per block at the configured rate, and deliberately
+// has NO acknowledgement channel.
+//
+// The upload pacer counts outstanding grants so an idle period cannot be banked
+// as a burst. Copying that here deadlocked: a downloader takes a grant and
+// immediately acks, so with every peer blocked sending an ack and the pacer
+// blocked sending the next grant, nobody was left to receive one. An unbuffered
+// channel already gives the property the ack was there to provide -- the pacer
+// cannot run ahead, because `grant <- 1` blocks until a peer actually takes it,
+// so at most one grant is ever outstanding.
+func dpacer(grant, interval_ms) { for 1 == 1 { grant <- 1
+		sleep(interval_ms) } }
+
+func job_start(id, t, dir, peers, peerid, timeout, down_limit_kbs) (j) { j = Job{id: id, dir: dir, t: t, work: make(chan int), res: make(chan string), have: []int{}, live: 0, nworkers: 0, nohaves: 0, s: Stats{total: t.npieces}, started: now_ms(), active: 1, dgrant: make(chan int), dlimited: 0, down_limit: down_limit_kbs}
 	j.have = store_scan(t, dir)
 	i := 0
 	for i < t.npieces { if j.have[i] == 1 { j.s.done = j.s.done + 1  j.s.bytes = j.s.bytes + piece_size(t, i) }  i = i + 1 }
 	if j.s.done == t.npieces { j.s.complete = 1  j.active = 0  return j }
+	// One grant per 16 KiB block at the requested rate.
+	if down_limit_kbs > 0 { j.dlimited = 1
+		interval := (BLOCK * 1000) / (down_limit_kbs * 1024)
+		if interval < 1 { interval = 1 }
+		go dpacer(j.dgrant, interval) }
 	i = 0
 	for i < t.npieces { if j.have[i] == 0 { j.work <- i }  i = i + 1 }
+	// A cap has to bound CONCURRENCY as well as rate, or it wastes almost
+	// everything it transfers. Blocks are only persisted once a whole piece
+	// verifies, so with one grant stream shared by dozens of peers every peer
+	// crawls through a partial piece and none of them finish -- measured: 27
+	// peers at 256 KB/s completed ONE piece in 13 s while the bytes for many
+	// others were downloaded and then thrown away on exit.
+	//
+	// One worker per 64 KB/s of budget keeps each peer fast enough to finish
+	// pieces, so the bytes that arrive are bytes that get kept.
+	maxw := len(peers)
+	if down_limit_kbs > 0 { maxw = down_limit_kbs / 64
+		if maxw < 1 { maxw = 1 }
+		if maxw > len(peers) { maxw = len(peers) } }
 	i = 0
-	for i < len(peers) { go peer_worker(peers[i].ip, peers[i].port, t, dir, t.infohash, peerid, j.work, j.res, timeout)
-		j.live = j.live + 1
-		j.nworkers = j.nworkers + 1
+	for i < len(peers) { if i < maxw { go peer_worker(peers[i].ip, peers[i].port, t, dir, t.infohash, peerid, j.work, j.res, timeout, j.dgrant, j.dlimited)
+			j.live = j.live + 1
+			j.nworkers = j.nworkers + 1 }
 		i = i + 1 }
 	if j.live == 0 { j.active = 0 } }
 
@@ -127,7 +162,7 @@ func job_starved(j) (yes) { yes = 0
 
 // engine_download is the blocking form: start, then pump until done or the
 // deadline. Same logic, one implementation.
-func engine_download(t, dir, peers, peerid, timeout, deadline_ms, progress) (s) { j := job_start("cli", t, dir, peers, peerid, timeout)
+func engine_download(t, dir, peers, peerid, timeout, deadline_ms, down_limit_kbs, progress) (s) { j := job_start("cli", t, dir, peers, peerid, timeout, down_limit_kbs)
 	for j.active == 1 { if now_ms() - j.started > deadline_ms { j = job_stop(j)  break }
 		j = job_pump(j, progress)
 		if job_starved(j) == 1 { j.nohaves = 0  sleep(200) }

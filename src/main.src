@@ -188,7 +188,9 @@ func cmd_get(a) { src := arg_at(a, 2)
 			for k < len(dp) { if peer_new(peers, dp[k]) == 1 { peers = append(peers, dp[k]) }  k = k + 1 } } } }
 	if len(peers) == 0 { fail(EXIT_NETWORK, "no_peers", "neither the trackers nor the DHT returned a peer for " + t.infohash, []string{"retry -- swarms are intermittent", "check network reachability to udp trackers"}) }
 	if progress == 1 { eprint("essaim: " + str(len(peers)) + " peers, starting") }
-	s := engine_download(t, dir, peers, pid, timeout, deadline, progress)
+	downlimit := parse_int(flag_val(a, "--down-limit", "0"))
+	if progress == 1 { if downlimit > 0 { eprint("essaim: download capped at " + str(downlimit) + " KB/s (global)") } }
+	s := engine_download(t, dir, peers, pid, timeout, deadline, downlimit, progress)
 	body := "{\"infohash\":\"" + t.infohash + "\",\"name\":\"" + jesc(t.name) + "\",\"dir\":\"" + jesc(dir) + "\",\"complete\":" + boolstr(s.complete) + ",\"pieces_done\":" + str(s.done) + ",\"pieces_total\":" + str(s.total) + ",\"bytes\":" + str(s.bytes) + ",\"peers_used\":" + str(s.peers_ok) + ",\"peers_dead\":" + str(s.peers_dead) + ",\"elapsed_ms\":" + str(s.elapsed) + "}"
 	if s.complete == 0 { println("{\"ok\":false,\"version\":\"" + VERSION + "\",\"error\":{\"code\":105,\"type\":\"incomplete\",\"message\":\"stopped with " + str(s.done) + "/" + str(s.total) + " pieces\",\"recoverable\":true,\"suggestions\":[\"run the same command again -- verified pieces are kept and the download resumes\"]},\"data\":" + body + "}")
 		flush()

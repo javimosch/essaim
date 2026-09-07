@@ -82,16 +82,27 @@ func cmd_set(a) { id := arg_at(a, 2)
 	if flag_on(a, "--no-seed") == 1 { fields = append(fields, "\"seed\":0") }
 	uv := flag_val(a, "--up-limit", "")
 	if uv != "" { fields = append(fields, "\"up_limit\":" + uv) }
+	dv := flag_val(a, "--down-limit", "")
+	if dv != "" { fields = append(fields, "\"down_limit\":" + dv) }
 	rv := flag_val(a, "--ratio-pct", "")
 	if rv != "" { fields = append(fields, "\"ratio_limit_pct\":" + rv) }
-	if len(fields) == 0 { fail(EXIT_ARGS, "nothing_to_set", "give at least one of --seed, --no-seed, --up-limit, --ratio-pct", []string{"essaim set <id> --no-seed"}) }
+	if len(fields) == 0 { fail(EXIT_ARGS, "nothing_to_set", "give at least one of --seed, --no-seed, --up-limit, --down-limit, --ratio-pct", []string{"essaim set <id> --no-seed"}) }
 	st, b, err := http_do_b("PATCH", url + "/torrents/" + id, "{" + join(fields, ",") + "}", auth_header(a), 20000)
 	if err != "" { fail(EXIT_NETWORK, "daemon_unreachable", err, []string{}) }
 	if st == 404 { fail(EXIT_NOTFOUND, "not_found", "no torrent with id " + id, []string{"essaim status"}) }
 	if st != 200 { fail(EXIT_EXTERNAL, "set_failed", bytes_str(b), []string{}) }
-	println(bytes_str(b))
-	flush()
-	exit(EXIT_OK) }
+	emit(daemon_data(b)) }
+
+// daemon_data re-wraps a daemon reply in the CLI's own envelope. The daemon
+// answers {"ok":true,"torrent":{...}}, which is the right shape for HTTP and the
+// WRONG shape for stdout: every other command emits {"ok":..,"version":..,"data":..}
+// and an agent should not have to know which commands happen to be daemon-backed
+// in order to find the payload. Strip the transport's "ok" and hand the rest to
+// emit as data. A body that does not carry the prefix is passed through unchanged
+// rather than mangled.
+func daemon_data(b) (d) { s := bytes_str(b)
+	d = s
+	if has_prefix(s, "{\"ok\":true,") { d = "{" + substr(s, 11, len(s)) } }
 
 func cmd_add(a) { src := arg_at(a, 2)
 	if src == "" { fail(EXIT_ARGS, "missing_argument", "add needs a magnet, .torrent path, or url", []string{"essaim add \"magnet:?xt=urn:btih:...\" --dir ./dl"}) }
@@ -99,13 +110,11 @@ func cmd_add(a) { src := arg_at(a, 2)
 	up, _ := daemon_probe(url)
 	if up == 0 { fail(EXIT_VALIDATION, "daemon_not_running", "no daemon is answering at " + url, []string{"essaim daemon start", "or use `essaim get` to download in the foreground"}) }
 	seed := flag_on(a, "--seed")
-	body := "{\"source\":\"" + jesc(src) + "\",\"dir\":\"" + jesc(flag_val(a, "--dir", ".")) + "\",\"seed\":" + str(seed) + ",\"up_limit\":" + flag_val(a, "--up-limit", "0") + ",\"ratio_limit_pct\":" + flag_val(a, "--ratio-pct", "0") + "}"
+	body := "{\"source\":\"" + jesc(src) + "\",\"dir\":\"" + jesc(flag_val(a, "--dir", ".")) + "\",\"seed\":" + str(seed) + ",\"up_limit\":" + flag_val(a, "--up-limit", "0") + ",\"down_limit\":" + flag_val(a, "--down-limit", "0") + ",\"ratio_limit_pct\":" + flag_val(a, "--ratio-pct", "0") + "}"
 	st, b, err := http_do_b("POST", url + "/torrents", body, auth_header(a), 20000)
 	if err != "" { fail(EXIT_NETWORK, "daemon_unreachable", err, []string{}) }
 	if st != 200 { fail(EXIT_EXTERNAL, "add_failed", bytes_str(b), []string{}) }
-	println(bytes_str(b))
-	flush()
-	exit(EXIT_OK) }
+	emit(daemon_data(b)) }
 
 func cmd_ls(a) { url := daemon_url(a)
 	up, _ := daemon_probe(url)
@@ -116,9 +125,7 @@ func cmd_ls(a) { url := daemon_url(a)
 	st, b, err := http_do_b("GET", target, "", auth_header(a), 10000)
 	if err != "" { fail(EXIT_NETWORK, "daemon_unreachable", err, []string{}) }
 	if st == 404 { fail(EXIT_NOTFOUND, "not_found", "no torrent with id " + id, []string{"essaim status"}) }
-	println(bytes_str(b))
-	flush()
-	exit(EXIT_OK) }
+	emit(daemon_data(b)) }
 
 func cmd_rm(a) { id := arg_at(a, 2)
 	if id == "" { fail(EXIT_ARGS, "missing_argument", "rm needs a torrent id", []string{"essaim status"}) }
@@ -126,9 +133,7 @@ func cmd_rm(a) { id := arg_at(a, 2)
 	st, b, err := http_do_b("DELETE", url + "/torrents/" + id, "", auth_header(a), 10000)
 	if err != "" { fail(EXIT_NETWORK, "daemon_unreachable", err, []string{"essaim daemon start"}) }
 	if st == 404 { fail(EXIT_NOTFOUND, "not_found", "no torrent with id " + id, []string{}) }
-	println(bytes_str(b))
-	flush()
-	exit(EXIT_OK) }
+	emit(daemon_data(b)) }
 
 func auth_header(a) (h) { h = ""
 	t := flag_val(a, "--token", env("ESSAIM_TOKEN"))

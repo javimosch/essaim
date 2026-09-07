@@ -79,46 +79,68 @@ func seed_peer(fd, t, dir, peerid, bfhex, grant, ack, limited, stats, maxblock) 
 					stats <- json(SeedStat{kind: "block", peer: who, bytes: length, piece: idx}) }
 				if limited == 1 { ack <- 1 } } } } }
 
-// seed_serve listens and serves until the deadline. Returns totals; progress
-// goes to stderr so stdout stays one JSON object.
-func seed_serve(t, dir, port, uplimit_kbs, duration_ms, peerid, progress) (up, peers, err) { up = 0  peers = 0  err = ""
+// ---- the seeder, split the same way as the engine ----
+//
+// seed_start opens the port and returns; seed_pump drains whatever the upload
+// goroutines have reported. seed_serve is then a pump loop, so the daemon and
+// the foreground command share one implementation.
+
+type Seeder struct { srv int  stats chan string  grant chan int  ack chan int  limited int  up int  peers int  active int  port int  uplimit int }
+
+func seed_start(t, dir, port, uplimit_kbs, peerid) (sd, err) { sd = Seeder{srv: 0 - 1, stats: make(chan string), grant: make(chan int), ack: make(chan int), limited: 0, up: 0, peers: 0, active: 0, port: port, uplimit: uplimit_kbs}
+	err = ""
 	have := store_scan(t, dir)
 	nhave := 0
 	i := 0
 	for i < len(have) { if have[i] == 1 { nhave = nhave + 1 }  i = i + 1 }
-	if nhave == 0 { err = "nothing to seed: no verified pieces in " + dir  return up, peers, err }
-	srv := listen(port)
-	if srv < 0 { err = "cannot bind port " + str(port)  return up, peers, err }
-	bfhex := to_hex(have_bitfield(have))
-	stats := make(chan string)
-	grant := make(chan int)
-	ack := make(chan int)
-	limited := 0
-	if uplimit_kbs > 0 { limited = 1
-		// one grant per 16 KiB block; burst of 4 blocks keeps a fast peer smooth
-		// without letting an idle minute cash in later
+	if nhave == 0 { err = "nothing to seed: no verified pieces in " + dir  return sd, err }
+	sd.srv = listen(port)
+	if sd.srv < 0 { err = "cannot bind port " + str(port)  return sd, err }
+	if uplimit_kbs > 0 { sd.limited = 1
+		// one grant per 16 KiB block; a burst of 4 keeps a fast peer smooth
+		// without letting an idle minute be cashed in later
 		interval := (BLOCK * 1000) / (uplimit_kbs * 1024)
 		if interval < 1 { interval = 1 }
-		go pacer(grant, ack, interval, 4) }
-	if progress == 1 { eprint("essaim: seeding " + t.name + " -- " + str(nhave) + "/" + str(t.npieces) + " pieces on port " + str(port))
-		if limited == 1 { eprint("essaim: upload capped at " + str(uplimit_kbs) + " KB/s (global)") }
-		if limited == 0 { eprint("essaim: upload uncapped") } }
-	go seed_accept(srv, t, dir, peerid, bfhex, grant, ack, limited, stats)
+		go pacer(sd.grant, sd.ack, interval, 4) }
+	go seed_accept(sd.srv, t, dir, peerid, to_hex(have_bitfield(have)), sd.grant, sd.ack, sd.limited, sd.stats)
+	sd.active = 1 }
+
+func seed_pump(sd, progress) (out) { out = sd
+	if out.active == 0 { return out }
+	drained := 1
+	for drained == 1 { drained = 0
+		select { case m := <-out.stats: drained = 1
+			st := parse(m, SeedStat{})
+			if st.kind == "connect" { out.peers = out.peers + 1
+				if progress == 1 { eprint("essaim: peer " + st.peer + " connected") } }
+			if st.kind == "block" { out.up = out.up + st.bytes }
+			if st.kind == "bye" { if progress == 1 { eprint("essaim: peer " + st.peer + " gone after " + str(st.bytes) + " bytes") } }
+		default: } } }
+
+func seed_stop(sd) (out) { out = sd
+	if out.active == 1 { close(out.srv)  out.active = 0 } }
+
+// seed_serve is the blocking form used by `essaim seed`.
+func seed_serve(t, dir, port, uplimit_kbs, duration_ms, peerid, progress) (up, peers, err) { up = 0  peers = 0
+	sd, e := seed_start(t, dir, port, uplimit_kbs, peerid)
+	err = e
+	if err != "" { return up, peers, err }
+	nh := 0
+	have := store_scan(t, dir)
+	i := 0
+	for i < len(have) { if have[i] == 1 { nh = nh + 1 }  i = i + 1 }
+	if progress == 1 { eprint("essaim: seeding " + t.name + " -- " + str(nh) + "/" + str(t.npieces) + " pieces on port " + str(port))
+		if sd.limited == 1 { eprint("essaim: upload capped at " + str(uplimit_kbs) + " KB/s (global)") }
+		if sd.limited == 0 { eprint("essaim: upload uncapped") } }
 	t0 := now_ms()
 	lastreport := t0
-	for now_ms() - t0 < duration_ms { drained := 1
-		for drained == 1 { drained = 0
-			select { case m := <-stats: drained = 1
-				s := parse(m, SeedStat{})
-				if s.kind == "connect" { peers = peers + 1
-					if progress == 1 { eprint("essaim: peer " + s.peer + " connected") } }
-				if s.kind == "block" { up = up + s.bytes }
-				if s.kind == "bye" { if progress == 1 { eprint("essaim: peer " + s.peer + " gone after " + str(s.bytes) + " bytes") } }
-			default: } }
+	for now_ms() - t0 < duration_ms { sd = seed_pump(sd, progress)
 		if progress == 1 { if now_ms() - lastreport > 10000 { lastreport = now_ms()
-				eprint("essaim: uploaded " + str(up) + " bytes to " + str(peers) + " peers") } }
+				eprint("essaim: uploaded " + str(sd.up) + " bytes to " + str(sd.peers) + " peers") } }
 		sleep(100) }
-	close(srv) }
+	up = sd.up
+	peers = sd.peers
+	sd = seed_stop(sd) }
 
 func seed_accept(srv, t, dir, peerid, bfhex, grant, ack, limited, stats) { for 1 == 1 { fd := accept(srv)
 		if fd < 0 { return }

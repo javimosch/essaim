@@ -1,0 +1,79 @@
+var g_fail = 0
+
+func expect(name, got, want) { if got == want { println("ok   " + name)  return }
+	println("FAIL " + name + "\n  got  " + got + "\n  want " + want)
+	g_fail = g_fail + 1 }
+
+func srv(host, port, token, done) { e := daemon_serve(host, port, token, 100, 6899, 3000, 0)
+	done <- e }
+
+func main() { home := "/tmp/essaim-daemon-test"
+	system("rm -rf " + home)
+	// registry round trip: the daemon's memory of WHICH torrents it manages
+	mkdir_p(home)
+	expect("home-env", str(len(essaim_home()) > 0), "true")
+	// json helpers the routes lean on
+	expect("unq-quoted", unq("\"abc\""), "abc")
+	expect("unq-bare", unq("42"), "42")
+	expect("unq-empty", unq(""), "")
+	expect("jget-miss", jget("{\"a\":1}", ".nope"), "")
+	expect("jget-hit", jget("{\"a\":1}", ".a"), "1")
+	// token gating: an empty configured token means loopback-only and open;
+	// a configured one must match exactly
+	expect("token-open", str(token_ok("{}", "")), "1")
+	expect("token-good", str(token_ok("{\"token\":\"s3cret\"}", "s3cret")), "1")
+	expect("token-bad", str(token_ok("{\"token\":\"nope\"}", "s3cret")), "0")
+	expect("token-missing", str(token_ok("{}", "s3cret")), "0")
+	// record indexing and removal keep the three parallel tables aligned
+	rs := []Rec{Rec{id: "a"}, Rec{id: "b"}, Rec{id: "c"}}
+	expect("rec-index", str(rec_index(rs, "b")), "1")
+	expect("rec-index-miss", str(rec_index(rs, "z")), "-1")
+	rr := rec_remove(rs, 1)
+	expect("rec-remove-len", str(len(rr)), "2")
+	expect("rec-remove-kept", rr[0].id + rr[1].id, "ac")
+	expect("id-len", str(len(new_id())), "12")
+	expect("id-unique", str(new_id() != new_id()), "true")
+	// the unit file must name the binary and keep the API on loopback
+	u := unit_text("/opt/essaim", "127.0.0.1", "8686")
+	expect("unit-exec", str(contains(u, "ExecStart=/opt/essaim serve")), "true")
+	expect("unit-restart", str(contains(u, "Restart=always")), "true")
+	expect("unit-install", str(contains(u, "WantedBy=default.target")), "true")
+	// a live daemon: health, add, list, delete, shutdown
+	done := make(chan string)
+	go srv("127.0.0.1", 18790, "tok", done)
+	sleep(500)
+	base := "http://127.0.0.1:18790"
+	st, b, e := http_get_b(base + "/_health", 2000)
+	expect("health-status", str(st), "200")
+	expect("health-err", e, "")
+	expect("health-ok", str(contains(bytes_str(b), "\"ok\":true")), "true")
+	// unknown path is a 404, not a hang or a crash
+	st4, _, _ := http_get_b(base + "/torrents/nope", 2000)
+	expect("missing-404", str(st4), "404")
+	// add requires a source
+	stb, _, _ := http_post_b(base + "/torrents", "{}", 3000)
+	expect("add-needs-source", str(stb), "400")
+	// a real add returns an id immediately, without resolving first
+	sta, ba, _ := http_post_b(base + "/torrents", "{\"source\":\"/nonexistent.torrent\",\"dir\":\"" + home + "\"}", 3000)
+	expect("add-status", str(sta), "200")
+	id := unq(jget(bytes_str(ba), ".torrent.id"))
+	expect("add-returned-id", str(len(id)), "12")
+	expect("add-state-resolving", unq(jget(bytes_str(ba), ".torrent.state")), "resolving")
+	// and it is listed
+	stl, bl, _ := http_get_b(base + "/torrents", 2000)
+	expect("list-status", str(stl), "200")
+	expect("list-has-one", unq(jget(bytes_str(bl), ".torrents[0].id")), id)
+	// an unresolvable source must land in "error", not spin forever
+	sleep(2500)
+	stg, bg, _ := http_get_b(base + "/torrents/" + id, 2000)
+	expect("get-one", str(stg), "200")
+	expect("bad-source-errors", unq(jget(bytes_str(bg), ".torrent.state")), "error")
+	// shutdown is token-gated
+	stx, _, _ := http_post_b(base + "/_shutdown", "{\"token\":\"wrong\"}", 2000)
+	expect("shutdown-rejects", str(stx), "401")
+	sty, _, _ := http_post_b(base + "/_shutdown", "{\"token\":\"tok\"}", 2000)
+	expect("shutdown-accepts", str(sty), "200")
+	expect("serve-returned", <-done, "")
+	system("rm -rf " + home)
+	if g_fail == 0 { println("\nALL PASS") }
+	if g_fail > 0 { println("\n" + str(g_fail) + " FAILED")  exit(1) } }

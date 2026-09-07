@@ -1,0 +1,123 @@
+// The client half of the daemon: `serve` runs the supervisor, and the rest are
+// thin HTTP calls against it (cli-daemon-spec).
+//
+// Binding is LOOPBACK BY DEFAULT. A daemon that takes magnets over HTTP has no
+// business listening on a public interface by accident, so reaching further
+// takes both an explicit --host and a --token.
+
+func daemon_url(a) (u) { host := flag_val(a, "--host", "127.0.0.1")
+	u = "http://" + host + ":" + flag_val(a, "--port", "8686") }
+
+func cmd_serve(a) { host := flag_val(a, "--host", "127.0.0.1")
+	port := parse_int(flag_val(a, "--port", "8686"))
+	token := flag_val(a, "--token", env("ESSAIM_TOKEN"))
+	if host != "127.0.0.1" { if host != "localhost" { if token == "" { fail(EXIT_VALIDATION, "token_required", "binding to " + host + " exposes the control API, so --token (or ESSAIM_TOKEN) is required", []string{"essaim serve --host " + host + " --token \"$(openssl rand -hex 16)\"", "or drop --host and keep it on loopback"}) } } }
+	err := daemon_serve(host, port, token, 200, parse_int(flag_val(a, "--peer-port", "6881")), parse_int(flag_val(a, "--timeout", "15000")), 1 - flag_on(a, "--quiet"))
+	if err != "" { fail(EXIT_NETWORK, "serve_failed", err, []string{"another daemon may already hold the port: essaim daemon status"}) }
+	emit("{\"stopped\":true}") }
+
+// daemon start/stop/status are IDEMPOTENT and probe over HTTP rather than
+// trusting a pid file: a stale pid says a process exists, only a health check
+// says the daemon is actually answering.
+func cmd_daemon(a) { sub := arg_at(a, 2)
+	if sub == "unit" { cmd_daemon_unit(a) }
+	url := daemon_url(a)
+	if sub == "status" { up, body := daemon_probe(url)
+		if up == 0 { emit("{\"running\":false,\"url\":\"" + jesc(url) + "\"}") }
+		emit("{\"running\":true,\"url\":\"" + jesc(url) + "\",\"health\":" + body + "}") }
+	if sub == "start" { up, _ := daemon_probe(url)
+		if up == 1 { emit("{\"running\":true,\"started\":false,\"url\":\"" + jesc(url) + "\",\"note\":\"already running\"}") }
+		self := args()[0]
+		host := flag_val(a, "--host", "127.0.0.1")
+		port := flag_val(a, "--port", "8686")
+		logf := essaim_home() + "/daemon.log"
+		mkdir_p(essaim_home())
+		tok := flag_val(a, "--token", "")
+		targ := ""
+		if tok != "" { targ = " --token " + tok }
+		// setsid detaches from this terminal so the daemon survives the shell
+		// that started it; stdin from /dev/null so it can never block on a tty
+		system("setsid " + self + " serve --host " + host + " --port " + port + targ + " >> " + logf + " 2>&1 < /dev/null &")
+		waited := 0
+		for waited < 5000 { sleep(200)
+			waited = waited + 200
+			u2, b2 := daemon_probe(url)
+			if u2 == 1 { emit("{\"running\":true,\"started\":true,\"url\":\"" + jesc(url) + "\",\"log\":\"" + jesc(logf) + "\",\"health\":" + b2 + "}") } }
+		fail(EXIT_NETWORK, "start_failed", "daemon did not answer /_health within 5s", []string{"check " + logf}) }
+	if sub == "stop" { up, _ := daemon_probe(url)
+		if up == 0 { emit("{\"running\":false,\"stopped\":false,\"note\":\"not running\"}") }
+		tok := flag_val(a, "--token", env("ESSAIM_TOKEN"))
+		st, _, err := http_post_b(url + "/_shutdown", "{\"token\":\"" + jesc(tok) + "\"}", 5000)
+		if err != "" { fail(EXIT_NETWORK, "stop_failed", "could not reach the daemon: " + err, []string{}) }
+		if st == 401 { fail(EXIT_ARGS, "bad_token", "the daemon requires a token to shut down", []string{"essaim daemon stop --token <token>"}) }
+		waited := 0
+		for waited < 4000 { sleep(200)
+			waited = waited + 200
+			u2, _ := daemon_probe(url)
+			if u2 == 0 { emit("{\"running\":false,\"stopped\":true}") } }
+		fail(EXIT_EXTERNAL, "stop_timeout", "the daemon accepted the shutdown but is still answering", []string{}) }
+	fail(EXIT_ARGS, "unknown_subcommand", "daemon takes start, stop, status, or unit", []string{"essaim daemon status"}) }
+
+func daemon_probe(url) (up, body) { up = 0  body = "{}"
+	st, b, err := http_get_b(url + "/_health", 2000)
+	if err != "" { return up, body }
+	if st != 200 { return up, body }
+	up = 1
+	body = bytes_str(b) }
+
+// ---- the agent-facing verbs ----
+
+func cmd_add(a) { src := arg_at(a, 2)
+	if src == "" { fail(EXIT_ARGS, "missing_argument", "add needs a magnet, .torrent path, or url", []string{"essaim add \"magnet:?xt=urn:btih:...\" --dir ./dl"}) }
+	url := daemon_url(a)
+	up, _ := daemon_probe(url)
+	if up == 0 { fail(EXIT_VALIDATION, "daemon_not_running", "no daemon is answering at " + url, []string{"essaim daemon start", "or use `essaim get` to download in the foreground"}) }
+	seed := flag_on(a, "--seed")
+	body := "{\"source\":\"" + jesc(src) + "\",\"dir\":\"" + jesc(flag_val(a, "--dir", ".")) + "\",\"seed\":" + str(seed) + ",\"up_limit\":" + flag_val(a, "--up-limit", "0") + "}"
+	st, b, err := http_do_b("POST", url + "/torrents", body, auth_header(a), 20000)
+	if err != "" { fail(EXIT_NETWORK, "daemon_unreachable", err, []string{}) }
+	if st != 200 { fail(EXIT_EXTERNAL, "add_failed", bytes_str(b), []string{}) }
+	println(bytes_str(b))
+	flush()
+	exit(EXIT_OK) }
+
+func cmd_ls(a) { url := daemon_url(a)
+	up, _ := daemon_probe(url)
+	if up == 0 { fail(EXIT_VALIDATION, "daemon_not_running", "no daemon is answering at " + url, []string{"essaim daemon start"}) }
+	id := arg_at(a, 2)
+	target := url + "/torrents"
+	if id != "" { if has_prefix(id, "--") == false { target = url + "/torrents/" + id } }
+	st, b, err := http_do_b("GET", target, "", auth_header(a), 10000)
+	if err != "" { fail(EXIT_NETWORK, "daemon_unreachable", err, []string{}) }
+	if st == 404 { fail(EXIT_NOTFOUND, "not_found", "no torrent with id " + id, []string{"essaim status"}) }
+	println(bytes_str(b))
+	flush()
+	exit(EXIT_OK) }
+
+func cmd_rm(a) { id := arg_at(a, 2)
+	if id == "" { fail(EXIT_ARGS, "missing_argument", "rm needs a torrent id", []string{"essaim status"}) }
+	url := daemon_url(a)
+	st, b, err := http_do_b("DELETE", url + "/torrents/" + id, "", auth_header(a), 10000)
+	if err != "" { fail(EXIT_NETWORK, "daemon_unreachable", err, []string{"essaim daemon start"}) }
+	if st == 404 { fail(EXIT_NOTFOUND, "not_found", "no torrent with id " + id, []string{}) }
+	println(bytes_str(b))
+	flush()
+	exit(EXIT_OK) }
+
+func auth_header(a) (h) { h = ""
+	t := flag_val(a, "--token", env("ESSAIM_TOKEN"))
+	if t != "" { h = "X-Essaim-Token: " + t } }
+
+// cmd_daemon_unit PRINTS a systemd unit rather than installing one. Registering
+// a service is a privileged, host-shaped act with no portable contract -- and
+// cli-daemon-spec deliberately leaves boot persistence out of scope -- so essaim
+// hands you a file to read and install yourself.
+func cmd_daemon_unit(a) { self := args()[0]
+	host := flag_val(a, "--host", "127.0.0.1")
+	port := flag_val(a, "--port", "8686")
+	if flag_on(a, "--json") == 1 { emit("{\"unit\":\"" + jesc(unit_text(self, host, port)) + "\",\"install\":\"mkdir -p ~/.config/systemd/user && essaim daemon unit > ~/.config/systemd/user/essaim.service && systemctl --user daemon-reload && systemctl --user enable --now essaim && loginctl enable-linger $USER\"}") }
+	print(unit_text(self, host, port))
+	flush()
+	exit(EXIT_OK) }
+
+func unit_text(self, host, port) (u) { u = "[Unit]\nDescription=essaim BitTorrent daemon\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nExecStart=" + self + " serve --host " + host + " --port " + port + "\nRestart=always\nRestartSec=5\n# the peer port is the only thing that should face the internet\n# the control API stays on loopback unless you pass --host and --token\n\n[Install]\nWantedBy=default.target\n" }

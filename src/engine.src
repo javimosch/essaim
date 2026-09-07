@@ -63,47 +63,75 @@ func bitfield_set(bf, idx, npieces) (out) { out = bf
 	if (v / mask) - ((v / mask) / 2) * 2 == 0 { v = v + mask }
 	out = bytes_concat(bytes_concat(bytes_sub(out, 0, byteoff), from_hex(hex_of_byte(v))), bytes_sub(out, byteoff + 1, len(out))) }
 
-// engine_download runs until every piece verifies or the swarm runs dry.
-// It never retries internally past the swarm's own supply: when no live peer is
-// left it returns what it has, and the caller decides whether to re-announce.
-func engine_download(t, dir, peers, peerid, timeout, deadline_ms, progress) (s) { s = Stats{total: t.npieces}
-	t0 := now_ms()
-	have := store_scan(t, dir)
+// ---- the job: a download the supervisor can PUMP instead of block on ----
+//
+// engine_download blocks, which is right for `essaim get` and useless for a
+// daemon that has to serve HTTP and run several torrents at once. So the loop is
+// split: job_start spawns the workers and returns, job_pump drains whatever has
+// arrived and returns immediately. The blocking form is then just a pump loop,
+// so there is one implementation of the logic, not two.
+
+type Job struct { id string  dir string  t Torrent  work chan int  res chan string  have []int  live int  nworkers int  nohaves int  s Stats  started int  active int }
+
+func job_start(id, t, dir, peers, peerid, timeout) (j) { j = Job{id: id, dir: dir, t: t, work: make(chan int), res: make(chan string), have: []int{}, live: 0, nworkers: 0, nohaves: 0, s: Stats{total: t.npieces}, started: now_ms(), active: 1}
+	j.have = store_scan(t, dir)
 	i := 0
-	for i < t.npieces { if have[i] == 1 { s.done = s.done + 1  s.bytes = s.bytes + piece_size(t, i) }  i = i + 1 }
-	if s.done == t.npieces { s.complete = 1  s.elapsed = now_ms() - t0  return s }
-	work := make(chan int)
-	res := make(chan string)
+	for i < t.npieces { if j.have[i] == 1 { j.s.done = j.s.done + 1  j.s.bytes = j.s.bytes + piece_size(t, i) }  i = i + 1 }
+	if j.s.done == t.npieces { j.s.complete = 1  j.active = 0  return j }
 	i = 0
-	for i < t.npieces { if have[i] == 0 { work <- i }  i = i + 1 }
-	live := 0
+	for i < t.npieces { if j.have[i] == 0 { j.work <- i }  i = i + 1 }
 	i = 0
-	for i < len(peers) { go peer_worker(peers[i].ip, peers[i].port, t, dir, t.infohash, peerid, work, res, timeout)
-		live = live + 1
+	for i < len(peers) { go peer_worker(peers[i].ip, peers[i].port, t, dir, t.infohash, peerid, j.work, j.res, timeout)
+		j.live = j.live + 1
+		j.nworkers = j.nworkers + 1
 		i = i + 1 }
-	if live == 0 { s.elapsed = now_ms() - t0  return s }
-	nohaves := 0
-	for s.done < t.npieces { if live <= 0 { break }
-		if now_ms() - t0 > deadline_ms { break }
-		r := parse(<-res, Res{})
-		if r.kind == "ready" { s.peers_ok = s.peers_ok + 1 }
-		if r.kind == "gone" { live = live - 1
-			s.peers_dead = s.peers_dead + 1
-			// a peer that died holding a piece hands it back, so the work is
-			// not lost with the connection
-			if r.idx >= 0 { work <- r.idx } }
-		if r.kind == "nohave" { nohaves = nohaves + 1
-			work <- r.idx
-			// every live peer refusing in a row means nobody has it yet; yield
-			// rather than spinning the queue at full speed
-			if nohaves > live * 4 { nohaves = 0  sleep(200) } }
-		if r.kind == "bad" { work <- r.idx }
-		if r.kind == "piece" { if have[r.idx] == 0 { have[r.idx] = 1
-				s.done = s.done + 1
-				s.bytes = s.bytes + piece_size(t, r.idx)
-				if progress == 1 { eprint("piece " + str(r.idx + 1) + "/" + str(t.npieces) + " from " + r.peer) } } } }
-	// stop the workers so nothing is left parked on an empty queue
-	i = 0
-	for i < len(peers) { work <- 0 - 1  i = i + 1 }
-	if s.done == t.npieces { s.complete = 1 }
-	s.elapsed = now_ms() - t0 }
+	if j.live == 0 { j.active = 0 } }
+
+// job_pump drains everything waiting and returns at once. `progress` echoes each
+// verified piece to stderr for the foreground path.
+func job_pump(j, progress) (out) { out = j
+	if out.active == 0 { return out }
+	drained := 1
+	for drained == 1 { drained = 0
+		select { case m := <-out.res: drained = 1
+			r := parse(m, Res{})
+			if r.kind == "ready" { out.s.peers_ok = out.s.peers_ok + 1 }
+			if r.kind == "gone" { out.live = out.live - 1
+				out.s.peers_dead = out.s.peers_dead + 1
+				// a peer that died holding a piece hands it back, so the work is
+				// not lost with the connection
+				if r.idx >= 0 { out.work <- r.idx } }
+			if r.kind == "nohave" { out.nohaves = out.nohaves + 1
+				out.work <- r.idx }
+			if r.kind == "bad" { out.work <- r.idx }
+			if r.kind == "piece" { if out.have[r.idx] == 0 { out.have[r.idx] = 1
+					out.s.done = out.s.done + 1
+					out.s.bytes = out.s.bytes + piece_size(out.t, r.idx)
+					if progress == 1 { eprint("piece " + str(out.s.done) + "/" + str(out.t.npieces) + " from " + r.peer) } } }
+		default: } }
+	if out.s.done >= out.t.npieces { out.s.complete = 1  out = job_stop(out) }
+	if out.live <= 0 { out = job_stop(out) }
+	out.s.elapsed = now_ms() - out.started }
+
+// job_stop retires the workers so none is left parked on an empty queue.
+func job_stop(j) (out) { out = j
+	if out.active == 0 { return out }
+	i := 0
+	for i < out.nworkers { out.work <- 0 - 1  i = i + 1 }
+	out.active = 0 }
+
+// job_starved reports that every live peer refused the queue head, which means
+// nobody has it yet and the caller should yield rather than spin.
+func job_starved(j) (yes) { yes = 0
+	if j.live > 0 { if j.nohaves > j.live * 4 { yes = 1 } } }
+
+// engine_download is the blocking form: start, then pump until done or the
+// deadline. Same logic, one implementation.
+func engine_download(t, dir, peers, peerid, timeout, deadline_ms, progress) (s) { j := job_start("cli", t, dir, peers, peerid, timeout)
+	for j.active == 1 { if now_ms() - j.started > deadline_ms { j = job_stop(j)  break }
+		j = job_pump(j, progress)
+		if job_starved(j) == 1 { j.nohaves = 0  sleep(200) }
+		if j.active == 1 { sleep(20) } }
+	s = j.s
+	s.elapsed = now_ms() - j.started
+	if s.done >= t.npieces { s.complete = 1 } }

@@ -4,8 +4,13 @@
 # src/main.src is excluded because it owns main() -- the test provides its own.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+mapfile -t ALL < sources.txt
 LIB=()
-for f in src/*.src; do [ "$f" = "src/main.src" ] || LIB+=("$f"); done
+for f in "${ALL[@]}"; do [ "$f" = "src/main.src" ] || LIB+=("$f"); done
+# Isolate anything that touches daemon state: without this the daemon suite
+# reads the developer's real ~/.essaim registry and sees torrents it never added.
+export ESSAIM_HOME="$(mktemp -d)/essaim-test-home"
+trap 'rm -rf "$ESSAIM_HOME"' EXIT
 fail=0
 for t in tests/t_*.src; do
     out="$(mktemp -d)/t.mfl"

@@ -1,0 +1,55 @@
+// Turning a user-supplied source into a torrent, and a swarm into addresses,
+// plus the small JSON helpers both paths need.
+//
+// These live in their own module because the daemon needs them as much as the
+// one-shot commands do, and the test harness links every module except main.
+
+// source_bytes resolves a torrent argument to the raw bytes of a .torrent.
+// A magnet is accepted by the parser but cannot be downloaded yet: its metadata
+// lives in the swarm (BEP 9), so it is refused with a precise reason rather
+// than a generic failure.
+func source_bytes(src) (raw, err) { raw = bytes("")  err = ""
+	if has_prefix(src, "magnet:") { err = "magnet"  return raw, err }
+	if has_prefix(src, "http://") { raw, err = fetch_torrent(src)  return raw, err }
+	if has_prefix(src, "https://") { raw, err = fetch_torrent(src)  return raw, err }
+	raw = read_file_bytes(src)
+	if len(raw) == 0 { err = "notfound" } }
+
+func fetch_torrent(url) (raw, err) { raw = bytes("")  err = ""
+	status, body, e := http_get_b(url, 20000)
+	if e != "" { err = "network:" + e  return raw, err }
+	if status != 200 { err = "http:" + str(status)  return raw, err }
+	raw = body }
+
+// gather_peers announces to each tracker in turn and pools the results. It stops
+// as soon as it has a workable swarm rather than announcing to every tracker,
+// since each dead one costs a full timeout.
+func gather_peers(announce, infohash, left, pid, port, timeout, progress) (peers) { peers = []Peer{}
+	i := 0
+	for i < len(announce) { u := announce[i]
+		a := tracker_announce(u, infohash, pid, port, left, timeout)
+		if a.ok == 1 { j := 0
+			for j < len(a.peers) { if peer_new(peers, a.peers[j]) == 1 { peers = append(peers, a.peers[j]) }  j = j + 1 }
+			if progress == 1 { eprint("essaim: " + u + " -> " + str(len(a.peers)) + " peers (" + str(a.seeders) + " seeders)") } }
+		if a.ok == 0 { if progress == 1 { eprint("essaim: " + u + " -> " + a.err) } }
+		if len(peers) >= 40 { return peers }
+		i = i + 1 } }
+
+// parse_peers reads a comma-separated list of ip:port addresses.
+func parse_peers(spec) (out) { out = []Peer{}
+	if trim(spec) == "" { return out }
+	parts := split(trim(spec), ",")
+	i := 0
+	for i < len(parts) { hp := trim(parts[i])
+		c := index(hp, ":")
+		if c > 0 { p := parse_int(substr(hp, c + 1, len(hp)))
+			if p > 0 { out = append(out, Peer{ip: substr(hp, 0, c), port: p}) } }
+		i = i + 1 } }
+
+func boolstr(v) (s) { s = "false"
+	if v == 1 { s = "true" } }
+
+func str_list(xs) (j) { parts := []string{}
+	i := 0
+	for i < len(xs) { parts = append(parts, "\"" + jesc(xs[i]) + "\"")  i = i + 1 }
+	j = "[" + join(parts, ",") + "]" }

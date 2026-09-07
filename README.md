@@ -46,7 +46,11 @@ always equals `error.code` in the body.
   bare trackerless magnet resolved its full 15-file listing via DHT → BEP 9
 - **Seeding**: essaim served a torrent to another essaim at 6.2 MB/s uncapped,
   and the global cap held across three rates — 512→518, 1024→1058, 2048→2136 KB/s
-- `machin build --race-safe` passes: the engine is **proved** data-race free
+- **Daemon**: downloaded to completion while staying responsive, restored a
+  finished torrent across a restart in under a second with no network, and
+  resumed seeding — served 5.48 MB at 726 KB/s against its own 700 cap
+- `machin build --race-safe` passes: engine, seeder **and daemon** are all
+  **proved** data-race free
 
 ## Search sources
 
@@ -77,6 +81,55 @@ index must not sink a search. Rows marked `filter: "local"` return a firehose
 regardless of the query, so essaim narrows them itself.
 
 `essaim sources` lists what is compiled in and which rows are live.
+
+## Running in the background
+
+`get` and `seed` block, which is fine for something that finishes in a minute and
+useless for anything that doesn't — an agent can't hold a call for hours. So
+there is a daemon:
+
+```sh
+essaim daemon start                                  # loopback, idempotent
+essaim add "magnet:?xt=urn:btih:…" --dir ./dl --seed # returns an id immediately
+essaim status                                        # poll; JSON, one row per torrent
+essaim rm <id>
+essaim daemon stop
+```
+
+It is **single-actor**: one loop owns the job table and handles each request
+inline, so there is no lock and no second writer. That isn't caution for its own
+sake — the download engine already runs a goroutine per peer, and an HTTP handler
+touching the same state would make `machin build --race-safe` refuse to build.
+A control-plane request takes microseconds against a download that takes minutes.
+
+A freshly added torrent sits in `resolving`, then at 0 pieces, for up to ~30 s
+while it announces to trackers and runs a DHT lookup. That is discovery, not a
+stall — which is exactly why this belongs in a daemon rather than a call an agent
+has to hold open.
+
+State lives in `~/.essaim/` (override with `ESSAIM_HOME`): a small registry of
+*which* torrents you asked for, plus a `.torrent` cache. Per-torrent progress is
+still re-derived from the files on disk, so a restart re-verifies rather than
+trusting a journal — a completed torrent comes back **instantly, with no network
+at all**.
+
+### Surviving a reboot
+
+```sh
+mkdir -p ~/.config/systemd/user
+essaim daemon unit > ~/.config/systemd/user/essaim.service
+systemctl --user daemon-reload && systemctl --user enable --now essaim
+loginctl enable-linger $USER      # keeps it running after you log out
+```
+
+`essaim daemon unit` **prints** a unit rather than installing one. Registering a
+service is privileged and host-shaped, and cli-daemon-spec deliberately leaves
+boot persistence out of scope, so essaim hands you a file to read first. No sudo
+needed for the user-unit path.
+
+**The control API binds to loopback by default.** Reaching further needs both
+`--host` and `--token`, because that API accepts magnets. The peer port (6881) is
+the only thing meant to face the internet.
 
 ## Seeding
 
@@ -113,7 +166,7 @@ Follows the [cli-specs](https://cli-specs.intrane.fr/) family:
 | cli-update-spec | `essaim update` (content-hash + smoke test + `.bak`), `install`/`uninstall` |
 | cli-feedback-spec | `essaim feedback "…" --kind bug` — dual-write with an idempotency key |
 | cli-telemetry-spec | **deliberately not adopted** (see below) |
-| cli-daemon-spec | not yet — `get` is foreground |
+| cli-daemon-spec | `serve` + `/_health` + token-gated `/_shutdown` + `daemon start\|stop\|status`, loopback by default |
 
 **No telemetry, on purpose.** cli-telemetry-spec §8.1 says a tool that cannot
 satisfy the must-not-send list for its domain should ship none. For a BitTorrent
@@ -135,7 +188,7 @@ OpenSSL archives for musl.
 
 ```sh
 ./build.sh      # machin encode src/*.src > essaim.mfl && machin build essaim.mfl
-./tests/run.sh  # 252 assertions across 10 suites
+./tests/run.sh  # 285 assertions across 11 suites
 ```
 
 Tests need no network: the tracker suite stands up a fake BEP 15 tracker, the
@@ -144,7 +197,9 @@ index suite parses recorded response fixtures.
 
 ## Limits
 
-- No `watch` (folder monitoring) and no `serve`/daemon mode yet.
+- No `watch` (folder monitoring) yet.
+- The daemon is single-actor, so a very large job table would serialise
+  control-plane requests behind each other. Fine for tens of torrents.
 - The DHT is intermittent by nature: a lookup takes a few rounds and can come up
   empty on a quiet swarm, so a retry is normal. `--no-dht` turns it off.
 - Search sources are third-party indexes and go stale; `essaim sources` lists

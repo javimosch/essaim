@@ -1,0 +1,280 @@
+// The daemon: a supervisor that owns every torrent and answers HTTP.
+//
+// SINGLE-ACTOR BY CONSTRUCTION. The event loop accepts one connection at a time
+// and handles it inline -- there is no goroutine per request -- so the job table
+// has exactly one writer and no lock. That is not caution for its own sake: the
+// download engine already runs a goroutine per peer, and the moment an HTTP
+// handler on another goroutine touched the same state, `machin build
+// --race-safe` would refuse to build. A control-plane request takes microseconds
+// against a download that takes minutes, so serialising them costs nothing.
+//
+// The loop stays responsive because `accept()` honours socket_timeout: it
+// returns -1 after the tick, the loop pumps every job and seeder, and comes
+// back round. Blocking work -- resolving a magnet through the DHT, which takes
+// tens of seconds -- runs on its own goroutine and reports back over a channel,
+// so `add` answers immediately with state "resolving".
+
+type Rec struct { id string  source string  dir string  seed int  up_limit int  infohash string  name string  state string  done int  total int  bytes int  peers int  uploaded int  err string }
+
+type Resolved struct { id string  ok int  path string  infohash string  name string  peers string  err string }
+
+func essaim_home() (h) { h = env("ESSAIM_HOME")
+	if h == "" { h = env("HOME") + "/.essaim" } }
+
+func state_path() (p) { p = essaim_home() + "/state.json" }
+
+func torrent_cache(ih) (p) { p = essaim_home() + "/torrents/" + ih + ".torrent" }
+
+// ---- registry ----
+//
+// The daemon needs to know WHICH torrents it manages; per-torrent progress is
+// still re-derived from the files on disk at start, so this file is a small
+// list of intents, not a progress journal that could disagree with reality.
+
+func registry_load() (recs) { recs = []Rec{}
+	raw := read_file(state_path())
+	if raw == "" { return recs }
+	i := 0
+	for i < 4096 { idv, e := json_get(raw, ".jobs[" + str(i) + "].id")
+		if e != "" { return recs }
+		r := Rec{id: unq(idv), source: unq(jget(raw, ".jobs[" + str(i) + "].source")), dir: unq(jget(raw, ".jobs[" + str(i) + "].dir")), seed: parse_int(jget(raw, ".jobs[" + str(i) + "].seed")), up_limit: parse_int(jget(raw, ".jobs[" + str(i) + "].up_limit")), infohash: unq(jget(raw, ".jobs[" + str(i) + "].infohash")), name: unq(jget(raw, ".jobs[" + str(i) + "].name")), state: "pending"}
+		recs = append(recs, r)
+		i = i + 1 } }
+
+func jget(j, path) (v) { v = ""
+	x, e := json_get(j, path)
+	if e == "" { v = x } }
+
+func unq(v) (out) { out = v
+	if len(v) >= 2 { if charat(v, 0) == "\"" { out = substr(v, 1, len(v) - 1) } } }
+
+func registry_save(recs) { mkdir_p(essaim_home())
+	rows := []string{}
+	i := 0
+	for i < len(recs) { r := recs[i]
+		rows = append(rows, "{\"id\":\"" + r.id + "\",\"source\":\"" + jesc(r.source) + "\",\"dir\":\"" + jesc(r.dir) + "\",\"seed\":" + str(r.seed) + ",\"up_limit\":" + str(r.up_limit) + ",\"infohash\":\"" + r.infohash + "\",\"name\":\"" + jesc(r.name) + "\"}")
+		i = i + 1 }
+	write_file(state_path(), "{\"version\":1,\"jobs\":[" + join(rows, ",") + "]}") }
+
+// ---- resolution, off the event loop ----
+//
+// Turning a source into a .torrent can take a minute through the DHT, so it runs
+// on its own goroutine. The result is CACHED to disk, which means a daemon
+// restart re-reads the file instead of asking the swarm again.
+func resolver(id, src, port, timeout, out) { pid := peer_id_new()
+	raw := bytes("")
+	peers := []Peer{}
+	if has_prefix(src, "magnet:") { m := magnet_parse(src)
+		if m.ok == 0 { out <- json(Resolved{id: id, ok: 0, err: m.err})  return }
+		cached := read_file_bytes(torrent_cache(m.infohash))
+		if len(cached) > 0 { raw = cached }
+		peers = gather_peers(m.announce, m.infohash, 1048576, pid, port, timeout, 0)
+		if len(peers) < 4 { dp, _ := dht_get_peers(m.infohash, 30, 8, 3000, 0)
+			k := 0
+			for k < len(dp) { if peer_new(peers, dp[k]) == 1 { peers = append(peers, dp[k]) }  k = k + 1 } }
+		if len(raw) == 0 { if len(peers) == 0 { out <- json(Resolved{id: id, ok: 0, err: "no peers found for " + m.infohash})  return }
+			r, e := meta_from_swarm(peers, m.infohash, pid, 8000, 0)
+			if e != "" { out <- json(Resolved{id: id, ok: 0, err: "metadata: " + e})  return }
+			raw = r } }
+	if has_prefix(src, "magnet:") == false { b, e := source_bytes(src)
+		if e != "" { out <- json(Resolved{id: id, ok: 0, err: "cannot read source: " + e})  return }
+		raw = b }
+	t := torrent_parse(raw)
+	if t.ok == 0 { out <- json(Resolved{id: id, ok: 0, err: t.err})  return }
+	mkdir_p(essaim_home() + "/torrents")
+	write_file_bytes(torrent_cache(t.infohash), raw)
+	if len(peers) == 0 { peers = gather_peers(t.announce, t.infohash, t.total, pid, port, timeout, 0)
+		if len(peers) < 4 { dp, _ := dht_get_peers(t.infohash, 30, 8, 3000, 0)
+			k := 0
+			for k < len(dp) { if peer_new(peers, dp[k]) == 1 { peers = append(peers, dp[k]) }  k = k + 1 } } }
+	out <- json(Resolved{id: id, ok: 1, path: torrent_cache(t.infohash), infohash: t.infohash, name: t.name, peers: peers_join(peers)}) }
+
+func peers_join(ps) (s) { parts := []string{}
+	i := 0
+	for i < len(ps) { parts = append(parts, ps[i].ip + ":" + str(ps[i].port))  i = i + 1 }
+	s = join(parts, ",") }
+
+// ---- the HTTP surface ----
+
+func req_read(fd) (method, path, body, ok) { method = ""  path = ""  body = ""  ok = 0
+	socket_timeout(fd, 5000)
+	raw := bytes("")
+	guard := 0
+	for bytes_index(raw, bytes("\r\n\r\n"), 0) < 0 { guard = guard + 1
+		if guard > 64 { return method, path, body, ok }
+		c := read_bytes(fd)
+		if len(c) == 0 { return method, path, body, ok }
+		raw = bytes_concat(raw, c)
+		if len(raw) > 262144 { return method, path, body, ok } }
+	hdrend := bytes_index(raw, bytes("\r\n\r\n"), 0)
+	head := bytes_str(bytes_sub(raw, 0, hdrend))
+	lines := split(head, "\r\n")
+	if len(lines) == 0 { return method, path, body, ok }
+	parts := split(lines[0], " ")
+	if len(parts) < 2 { return method, path, body, ok }
+	method = parts[0]
+	path = parts[1]
+	clen := parse_int(header_of(raw, "content-length"))
+	have := len(raw) - (hdrend + 4)
+	for have < clen { c := read_bytes(fd)
+		if len(c) == 0 { break }
+		raw = bytes_concat(raw, c)
+		have = len(raw) - (hdrend + 4) }
+	body = bytes_str(bytes_sub(raw, hdrend + 4, len(raw)))
+	ok = 1 }
+
+func req_token(fd) (t) { t = "" }
+
+func respond(fd, status, body) { txt := "200 OK"
+	if status == 400 { txt = "400 Bad Request" }
+	if status == 401 { txt = "401 Unauthorized" }
+	if status == 404 { txt = "404 Not Found" }
+	if status == 500 { txt = "500 Internal Server Error" }
+	write(fd, "HTTP/1.1 " + txt + "\r\nContent-Type: application/json\r\nContent-Length: " + str(len(body)) + "\r\nConnection: close\r\n\r\n" + body)
+	close(fd) }
+
+func rec_json(r) (j) { j = "{\"id\":\"" + r.id + "\",\"source\":\"" + jesc(r.source) + "\",\"dir\":\"" + jesc(r.dir) + "\",\"infohash\":\"" + r.infohash + "\",\"name\":\"" + jesc(r.name) + "\",\"state\":\"" + r.state + "\",\"pieces_done\":" + str(r.done) + ",\"pieces_total\":" + str(r.total) + ",\"bytes\":" + str(r.bytes) + ",\"peers\":" + str(r.peers) + ",\"uploaded_bytes\":" + str(r.uploaded) + ",\"seed\":" + boolstr(r.seed) + ",\"up_limit_kbs\":" + str(r.up_limit) + ",\"error\":\"" + jesc(r.err) + "\"}" }
+
+func recs_json(recs) (j) { rows := []string{}
+	i := 0
+	for i < len(recs) { rows = append(rows, rec_json(recs[i]))  i = i + 1 }
+	j = "[" + join(rows, ",") + "]" }
+
+func new_id() (s) { s = to_hex(rand_bytes(6)) }
+
+// ---- the supervisor ----
+//
+// One loop owns everything: the record table, the running jobs, the seeders.
+// It accepts a connection (or times out), handles it inline, then pumps every
+// job and seeder before coming back round.
+
+func daemon_serve(host, port, token, tick, peerport, timeout, progress) (err) { err = ""
+	mkdir_p(essaim_home())
+	srv := listen(port)
+	if srv < 0 { err = "cannot bind " + host + ":" + str(port)  return err }
+	socket_timeout(srv, tick)
+	recs := registry_load()
+	jobs := []Job{}
+	seeders := []Seeder{}
+	resolved := make(chan string)
+	pid := peer_id_new()
+	// Restoring a torrent must not go near the network if it does not have to.
+	// A cached .torrent plus the files on disk answer "is this finished?" on
+	// their own, so a completed torrent comes back instantly and only an
+	// unfinished one pays for peer discovery.
+	i := 0
+	for i < len(recs) { jobs = append(jobs, Job{id: recs[i].id, active: 0})
+		seeders = append(seeders, Seeder{active: 0, srv: 0 - 1})
+		restored := 0
+		if recs[i].infohash != "" { cached := read_file_bytes(torrent_cache(recs[i].infohash))
+			if len(cached) > 0 { t := torrent_parse(cached)
+				if t.ok == 1 { jobs[i] = job_start(recs[i].id, t, recs[i].dir, []Peer{}, pid, timeout)
+					recs[i].total = t.npieces
+					recs[i].done = jobs[i].s.done
+					recs[i].bytes = jobs[i].s.bytes
+					if jobs[i].s.complete == 1 { recs[i].state = "complete"
+						restored = 1
+						if progress == 1 { eprint("essaim: " + recs[i].name + " restored complete (" + str(recs[i].done) + "/" + str(recs[i].total) + " verified)") } } } } }
+		if restored == 0 { recs[i].state = "resolving"
+			go resolver(recs[i].id, recs[i].source, peerport, timeout, resolved) }
+		i = i + 1 }
+	if progress == 1 { eprint("essaim: daemon listening on " + host + ":" + str(port) + " (" + str(len(recs)) + " torrents restored)") }
+	running := 1
+	for running == 1 { fd := accept(srv)
+		if fd >= 0 { method, path, body, ok := req_read(fd)
+			if ok == 0 { close(fd) }
+			if ok == 1 { if path == "/_health" { respond(fd, 200, "{\"ok\":true,\"version\":\"" + VERSION + "\",\"jobs\":" + str(len(recs)) + ",\"pid\":" + str(0) + "}") }
+				if path == "/_shutdown" { if token_ok(body, token) == 0 { respond(fd, 401, "{\"ok\":false,\"error\":\"bad or missing token\"}") }
+					if token_ok(body, token) == 1 { respond(fd, 200, "{\"ok\":true,\"stopping\":true}")  running = 0 } }
+				if path == "/torrents" { if method == "GET" { respond(fd, 200, "{\"ok\":true,\"torrents\":" + recs_json(recs) + "}") }
+					if method == "POST" { src := unq(jget(body, ".source"))
+						if src == "" { respond(fd, 400, "{\"ok\":false,\"error\":\"source is required\"}") }
+						if src != "" { r := Rec{id: new_id(), source: src, dir: unq(jget(body, ".dir")), seed: parse_int(jget(body, ".seed")), up_limit: parse_int(jget(body, ".up_limit")), state: "resolving"}
+							if r.dir == "" { r.dir = "." }
+							recs = append(recs, r)
+							jobs = append(jobs, Job{id: r.id, active: 0})
+							seeders = append(seeders, Seeder{active: 0, srv: 0 - 1})
+							registry_save(recs)
+							go resolver(r.id, r.source, peerport, timeout, resolved)
+							respond(fd, 200, "{\"ok\":true,\"torrent\":" + rec_json(r) + "}") } } }
+				if has_prefix(path, "/torrents/") { id := substr(path, 10, len(path))
+					k := rec_index(recs, id)
+					if k < 0 { respond(fd, 404, "{\"ok\":false,\"error\":\"no such torrent\"}") }
+					if k >= 0 { if method == "GET" { respond(fd, 200, "{\"ok\":true,\"torrent\":" + rec_json(recs[k]) + "}") }
+						if method == "DELETE" { jobs[k] = job_stop(jobs[k])
+							seeders[k] = seed_stop(seeders[k])
+							recs = rec_remove(recs, k)
+							jobs = job_remove(jobs, k)
+							seeders = seeder_remove(seeders, k)
+							registry_save(recs)
+							respond(fd, 200, "{\"ok\":true,\"removed\":\"" + id + "\"}") } } } } }
+		// fold in anything the resolvers finished
+		drained := 1
+		for drained == 1 { drained = 0
+			select { case m := <-resolved: drained = 1
+				rv := parse(m, Resolved{})
+				k := rec_index(recs, rv.id)
+				if k >= 0 { if rv.ok == 0 { recs[k].state = "error"  recs[k].err = rv.err }
+					if rv.ok == 1 { recs[k].infohash = rv.infohash
+						recs[k].name = rv.name
+						recs[k].err = ""
+						t := torrent_parse(read_file_bytes(rv.path))
+						if t.ok == 0 { recs[k].state = "error"  recs[k].err = "cached torrent will not parse" }
+						if t.ok == 1 { recs[k].total = t.npieces
+							jobs[k] = job_start(rv.id, t, recs[k].dir, parse_peers(rv.peers), pid, timeout)
+							// copy the starting counts immediately: a torrent
+							// already complete on disk never enters the pump
+							// loop, and would otherwise report 0 pieces forever
+							recs[k].done = jobs[k].s.done
+							recs[k].bytes = jobs[k].s.bytes
+							recs[k].state = "downloading"
+							if jobs[k].active == 0 { recs[k].state = "stalled"
+								if jobs[k].s.complete == 1 { recs[k].state = "complete" } }
+							registry_save(recs) } } }
+			default: } }
+		// pump every job and seeder
+		i = 0
+		for i < len(jobs) { if jobs[i].active == 1 { jobs[i] = job_pump(jobs[i], 0)
+				recs[i].done = jobs[i].s.done
+				recs[i].bytes = jobs[i].s.bytes
+				recs[i].peers = jobs[i].s.peers_ok
+				if jobs[i].active == 0 { recs[i].state = "stalled"
+					if jobs[i].s.done >= jobs[i].t.npieces { recs[i].state = "complete"
+						if progress == 1 { eprint("essaim: " + recs[i].name + " complete") } } } }
+			if seeders[i].active == 1 { seeders[i] = seed_pump(seeders[i], 0)
+				recs[i].uploaded = seeders[i].up
+				recs[i].peers = seeders[i].peers }
+			// a completed torrent that asked to seed starts serving, once
+			if recs[i].state == "complete" { if recs[i].seed == 1 { if seeders[i].active == 0 { if seeders[i].srv == 0 - 1 { t := torrent_parse(read_file_bytes(torrent_cache(recs[i].infohash)))
+								if t.ok == 1 { sd, serr := seed_start(t, recs[i].dir, peerport, recs[i].up_limit, pid)
+									seeders[i] = sd
+									if serr == "" { recs[i].state = "seeding"
+										if progress == 1 { eprint("essaim: seeding " + recs[i].name) } }
+									if serr != "" { recs[i].err = serr } } } } } }
+			i = i + 1 } }
+	close(srv)
+	registry_save(recs)
+	if progress == 1 { eprint("essaim: daemon stopped") } }
+
+// token_ok gates shutdown. An empty configured token means the daemon is
+// loopback-only and unauthenticated, which is the default; set --token to
+// require one.
+func token_ok(body, token) (ok) { ok = 0
+	if token == "" { ok = 1  return ok }
+	if unq(jget(body, ".token")) == token { ok = 1 } }
+
+func rec_index(recs, id) (k) { k = 0 - 1
+	i := 0
+	for i < len(recs) { if recs[i].id == id { k = i  return k }  i = i + 1 } }
+
+func rec_remove(recs, k) (out) { out = []Rec{}
+	i := 0
+	for i < len(recs) { if i != k { out = append(out, recs[i]) }  i = i + 1 } }
+
+func job_remove(jobs, k) (out) { out = []Job{}
+	i := 0
+	for i < len(jobs) { if i != k { out = append(out, jobs[i]) }  i = i + 1 } }
+
+func seeder_remove(sds, k) (out) { out = []Seeder{}
+	i := 0
+	for i < len(sds) { if i != k { out = append(out, sds[i]) }  i = i + 1 } }

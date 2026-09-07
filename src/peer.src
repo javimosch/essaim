@@ -86,6 +86,7 @@ func peer_fetch_piece(fd, buf, idx, plen, have, grant, limited) (data, outbuf, o
 	got := 0
 	acc := bytes("")
 	guard := 0
+	paced := 0
 	for got < plen { guard = guard + 1
 		if guard > nblocks * 64 + 256 { return data, outbuf, ok }
 		f := peer_msg(fd, outbuf)
@@ -102,7 +103,15 @@ func peer_fetch_piece(fd, buf, idx, plen, have, grant, limited) (data, outbuf, o
 					// which is the only thing that bounds a download. Pacing
 					// the requests instead would serialise the pipeline and
 					// still not stop a fast peer from filling the buffer.
-					if limited == 1 { <-grant } } } }
+					// Charge by BYTES, not by message. A grant is worth one
+					// 16 KiB block, but peers are free to send smaller ones --
+					// and charging a whole grant for a 2 KiB message throttled
+					// a 512 KB/s cap down to a measured 64 KB/s. Accumulating
+					// makes the cap independent of how a peer chooses to slice
+					// its replies.
+					if limited == 1 { paced = paced + len(block)
+						for paced >= BLOCK { <-grant
+							paced = paced - BLOCK } } } } }
 		if f.id == 0 { return data, outbuf, ok } }
 	data = acc
 	ok = 1 }

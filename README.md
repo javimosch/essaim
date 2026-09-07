@@ -103,6 +103,37 @@ altering a single integer meant `rm` + `add`, which threw away the record and
 re-resolved the metadata. It patches only the fields you pass, so `set --seed` never
 silently resets an upload cap.
 
+### Capping the download
+
+```sh
+essaim get "magnet:…" --dir ./dl --down-limit 512     # KB/s, global across peers
+essaim add "magnet:…" --dir ./dl --down-limit 512
+essaim set <id> --down-limit 512
+```
+
+It paces how fast blocks are **drained from the socket**, not how fast they are
+requested. Requests stay pipelined — a piece still costs one round trip — and
+TCP's window does the actual limiting. Pacing the requests instead would
+serialise the pipeline and still not stop a fast peer from filling the buffer.
+
+Measured against a live swarm, 45 s each, uncapped ≈ 1040 KB/s:
+
+| cap | completed-piece throughput |
+|---|---|
+| 512 KB/s | 353 KB/s |
+| 128 KB/s | 85 KB/s |
+
+Both are under their cap and the ratio between them is 4.15 against the 4.0
+asked for. The figures sit *below* the cap because `bytes` counts only
+**completed** pieces, and with dozens of peers there is always data in flight
+that has not finished a piece yet.
+
+Unlike the other three, a change to `--down-limit` applies **the next time the
+torrent starts**, not immediately: the pacer takes its interval when the job
+starts, and restarting a running job from the control loop would mean sending
+on an unbuffered channel to workers that may be parked — which hangs the
+supervisor. That was tried, and it froze the whole daemon.
+
 ### Stopping at a ratio
 
 `--up-limit` bounds the **rate** and never ends. A ratio is the thing that

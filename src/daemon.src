@@ -235,19 +235,21 @@ func daemon_serve(host, port, token, tick, peerport, timeout, progress) (err) { 
 							if pseed != "" { recs[k].seed = parse_flag(pseed) }
 							if pup != "" { recs[k].up_limit = parse_int(pup) }
 							if pratio != "" { recs[k].ratio_pct = parse_int(pratio) }
-							// A download pacer is created with its interval
-							// when the job starts, and MFL has no buffered
-							// channels -- so handing a running pacer a new rate
-							// from this loop would risk blocking the one
-							// goroutine that owns everything. Restarting the
-							// job is both safer and honest: progress is
-							// re-derived from the files on disk, so nothing is
-							// lost, and the resolver path that re-discovers
-							// peers is the same one every add already uses.
-							if pdown != "" { recs[k].down_limit = parse_int(pdown)
-								if jobs[k].active == 1 { jobs[k] = job_stop(jobs[k])
-									recs[k].state = "resolving"
-									go resolver(recs[k].id, recs[k].source, peerport, timeout, resolved) } }
+							// A download pacer takes its interval when the job
+							// starts, so a new cap applies the next time the
+							// torrent starts -- on the next daemon start, or
+							// after rm + add.
+							//
+							// It deliberately does NOT restart the job here.
+							// job_stop sends one -1 per worker on an UNBUFFERED
+							// channel, and a worker parked on a socket read or
+							// waiting for a grant is not there to receive it --
+							// which blocks the single-actor loop that owns
+							// every torrent. Tried it; it hung the whole
+							// daemon. Making a control-plane call able to
+							// freeze the supervisor is a far worse bug than a
+							// cap that waits for a restart.
+							if pdown != "" { recs[k].down_limit = parse_int(pdown) }
 							// A running seeder holds its cap from when it
 							// started, so any change to seeding means stopping
 							// it. srv goes back to -1 so the pump is free to

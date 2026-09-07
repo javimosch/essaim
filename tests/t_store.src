@@ -29,6 +29,16 @@ func main() { dir := "/tmp/essaim-store-test"
 	expect("read0", bytes_str(store_read_piece(t, dir, 0)), "ABCDEF")
 	expect("read2", bytes_str(store_read_piece(t, dir, 2)), "MNO")
 	expect("mkdir-nested", str(is_dir(dir + "/sub")), "true")
+	// RELATIVE paths are what a caller actually types; rebuilding a path by
+	// unconditionally prefixing "/" turned "./out" into "/./out" and failed
+	system("rm -rf /tmp/essaim-rel && mkdir -p /tmp/essaim-rel")
+	expect("mkdir-dot-rel", str(mkdir_p("/tmp/essaim-rel/./out")), "1")
+	expect("mkdir-dot-rel-exists", str(is_dir("/tmp/essaim-rel/out")), "true")
+	expect("mkdir-deep-rel", str(mkdir_p("/tmp/essaim-rel/a/b/c")), "1")
+	expect("mkdir-deep-exists", str(is_dir("/tmp/essaim-rel/a/b/c")), "true")
+	expect("mkdir-existing", str(mkdir_p(dir)), "1")
+	expect("mkdir-empty", str(mkdir_p("")), "1")
+	system("rm -rf /tmp/essaim-rel")
 	system("rm -rf " + dir)
 	if g_fail == 0 { println("\nALL PASS") }
 	if g_fail > 0 { println("\n" + str(g_fail) + " FAILED")  exit(1) } }

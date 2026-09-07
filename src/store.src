@@ -67,13 +67,23 @@ func parent_dir(p) (d) { d = ""
 	for i >= 0 { if charat(p, i) == "/" { d = substr(p, 0, i)  return d }  i = i - 1 } }
 
 // mkdir_p creates every missing component. machin's mkdir is one level only.
+//
+// Relative paths matter here: "./out" and "out/sub" are what a caller actually
+// types, and rebuilding a path by unconditionally prefixing "/" turns them into
+// ABSOLUTE paths ("/./out"), which then fail to create. So the leading slash is
+// preserved only if it was there to begin with, and "." components are dropped.
 func mkdir_p(p) (ok) { ok = 1
 	if p == "" { return ok }
+	if is_dir(p) { return ok }
+	abs := has_prefix(p, "/")
 	parts := split(p, "/")
 	cur := ""
-	if has_prefix(p, "/") { cur = "" }
 	i := 0
-	for i < len(parts) { if parts[i] != "" { cur = cur + "/" + parts[i]
-			if is_dir(cur) == false { mkdir(cur) } }
+	for i < len(parts) { seg := parts[i]
+		if seg != "" { if seg != "." { if cur == "" { if abs { cur = "/" + seg }
+					if abs == false { cur = seg } }
+				if cur != seg { if cur != "/" + seg { cur = cur + "/" + seg } }
+				if is_dir(cur) == false { mkdir(cur) } } }
 		i = i + 1 }
-	if is_dir(p) == false { ok = 0 } }
+	ok = 0
+	if is_dir(p) { ok = 1 } }

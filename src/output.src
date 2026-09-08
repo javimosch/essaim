@@ -18,7 +18,7 @@ var EXIT_NETWORK = 100
 var EXIT_EXTERNAL = 105
 var EXIT_INTERNAL = 110
 
-var VERSION = "0.5.5"
+var VERSION = "0.5.6"
 
 // eprint is the only way context reaches the user. Never println() a diagnostic.
 func eprint(s) { write(2, s + "\n") }

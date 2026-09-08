@@ -29,6 +29,65 @@ func state_path() (p) { p = essaim_home() + "/state.json" }
 
 func torrent_cache(ih) (p) { p = essaim_home() + "/torrents/" + ih + ".torrent" }
 
+// ---- home ownership ----
+//
+// state.json is the daemon's whole memory of WHICH torrents it manages, and it
+// is rewritten wholesale on shutdown. Two daemons sharing one ESSAIM_HOME
+// destroy each other silently: the second loads the registry, the first exits
+// and writes ITS view back, and whichever exits last wins. A daemon that
+// started with an empty registry wipes a running one's torrents. Nothing warns
+// you -- the files stay on disk, so it looks like they were merely forgotten.
+//
+// There is no atomic create-if-absent to lock with: MFL's mkdir returns 0 for
+// a directory that already exists, on purpose, so the usual mkdir-as-mutex
+// trick silently succeeds twice. Ownership is therefore a claim rather than a
+// lock, and it is enforced where the damage happens -- at the WRITE.
+//
+// A daemon writes a random token into daemon.owner at startup and re-reads it
+// before every save. Two daemons racing means the later claim wins the file,
+// and the earlier one then declines to persist instead of overwriting work it
+// does not own. Startup also refuses outright when the recorded owner is still
+// answering, which turns the common case into a clear error rather than a
+// race nobody sees.
+
+var OWNER_TOKEN = ""
+
+func owner_path() (p) { p = essaim_home() + "/daemon.owner" }
+
+// owner_read returns the recorded token and control port, or "" and 0.
+func owner_read() (tok, port) { tok = ""  port = 0
+	raw := trim(read_file(owner_path()))
+	if raw == "" { return tok, port }
+	sp := index(raw, " ")
+	if sp <= 0 { return tok, port }
+	tok = substr(raw, 0, sp)
+	port = parse_int(substr(raw, sp + 1, len(raw))) }
+
+// owner_answers asks whether a daemon is still live on that port. There is no
+// getpid in MFL, so the control port is the only handle on liveness.
+func owner_answers(port) (yes) { yes = 0
+	if port <= 0 { return yes }
+	status, _, err := http_get_b("http://127.0.0.1:" + str(port) + "/_health", 1500)
+	if err == "" { if status == 200 { yes = 1 } } }
+
+func owner_claim(port) (tok) { mkdir_p(essaim_home())
+	tok = new_id() + new_id()
+	write_file(owner_path(), tok + " " + str(port))
+	OWNER_TOKEN = tok }
+
+// owner_still_mine is the guard on every write. An unreadable owner file means
+// somebody removed it; taking that as "mine" keeps a single daemon working
+// after a tidy-up, which is the common case, while a token that belongs to
+// SOMEONE ELSE is the one thing that must stop a write.
+func owner_still_mine() (yes) { yes = 1
+	if OWNER_TOKEN == "" { return yes }
+	tok, _ := owner_read()
+	if tok == "" { return yes }
+	if tok != OWNER_TOKEN { yes = 0 } }
+
+func owner_release() { if OWNER_TOKEN != "" { tok, _ := owner_read()
+		if tok == OWNER_TOKEN { remove(owner_path()) } } }
+
 // ---- registry ----
 //
 // The daemon needs to know WHICH torrents it manages; per-torrent progress is
@@ -52,7 +111,11 @@ func jget(j, path) (v) { v = ""
 func unq(v) (out) { out = v
 	if len(v) >= 2 { if charat(v, 0) == "\"" { out = substr(v, 1, len(v) - 1) } } }
 
-func registry_save(recs) { mkdir_p(essaim_home())
+func registry_save(recs) { // Refusing to write is always safer than overwriting a registry that now
+	// belongs to another daemon: the torrents are still on disk either way.
+	if owner_still_mine() == 0 { eprint("essaim: another daemon owns " + essaim_home() + " -- not saving the registry")
+		return }
+	mkdir_p(essaim_home())
 	rows := []string{}
 	i := 0
 	for i < len(recs) { r := recs[i]
@@ -175,6 +238,13 @@ func daemon_serve(host, port, token, tick, peerport, timeout, progress) (err) { 
 	srv := listen(port)
 	if srv < 0 { err = "cannot bind " + host + ":" + str(port)  return err }
 	socket_timeout(srv, tick)
+	// Before the registry is read, so a second daemon never gets far enough to
+	// overwrite it on the way out.
+	otok, oport := owner_read()
+	if otok != "" { if owner_answers(oport) == 1 { close(srv)
+			err = "another essaim daemon owns " + essaim_home() + " and is answering on port " + str(oport)
+			return err } }
+	owner_claim(port)
 	recs := registry_load()
 	jobs := []Job{}
 	seeders := []Seeder{}
@@ -350,6 +420,7 @@ func daemon_serve(host, port, token, tick, peerport, timeout, progress) (err) { 
 			i = i + 1 } }
 	close(srv)
 	registry_save(recs)
+	owner_release()
 	if progress == 1 { eprint("essaim: daemon stopped") } }
 
 // token_ok gates shutdown. An empty configured token means the daemon is

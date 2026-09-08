@@ -161,24 +161,38 @@ func peers_join(ps) (s) { parts := []string{}
 	for i < len(ps) { parts = append(parts, ps[i].ip + ":" + str(ps[i].port))  i = i + 1 }
 	s = join(parts, ",") }
 
+// bearer pulls the token out of an Authorization header, for callers that reach
+// for the standard one. essaim's own CLI has always sent X-Essaim-Token, which
+// req_read reads directly -- the client side was built for this gate long
+// before the server checked it.
+//
+// A header rather than the body because GET has no body, and a query string
+// would put the token in every log and shell history that touches the URL.
+func bearer(v) (t) { t = ""
+	h := trim(v)
+	if h == "" { return t }
+	if len(h) < 8 { return t }
+	if to_lower(substr(h, 0, 7)) != "bearer " { return t }
+	t = trim(substr(h, 7, len(h))) }
+
 // ---- the HTTP surface ----
 
-func req_read(fd) (method, path, body, ok) { method = ""  path = ""  body = ""  ok = 0
+func req_read(fd) (method, path, body, auth, ok) { method = ""  path = ""  body = ""  auth = ""  ok = 0
 	socket_timeout(fd, 5000)
 	raw := bytes("")
 	guard := 0
 	for bytes_index(raw, bytes("\r\n\r\n"), 0) < 0 { guard = guard + 1
-		if guard > 64 { return method, path, body, ok }
+		if guard > 64 { return method, path, body, auth, ok }
 		c := read_bytes(fd)
-		if len(c) == 0 { return method, path, body, ok }
+		if len(c) == 0 { return method, path, body, auth, ok }
 		raw = bytes_concat(raw, c)
-		if len(raw) > 262144 { return method, path, body, ok } }
+		if len(raw) > 262144 { return method, path, body, auth, ok } }
 	hdrend := bytes_index(raw, bytes("\r\n\r\n"), 0)
 	head := bytes_str(bytes_sub(raw, 0, hdrend))
 	lines := split(head, "\r\n")
-	if len(lines) == 0 { return method, path, body, ok }
+	if len(lines) == 0 { return method, path, body, auth, ok }
 	parts := split(lines[0], " ")
-	if len(parts) < 2 { return method, path, body, ok }
+	if len(parts) < 2 { return method, path, body, auth, ok }
 	method = parts[0]
 	path = parts[1]
 	clen := parse_int(header_of(raw, "content-length"))
@@ -188,6 +202,8 @@ func req_read(fd) (method, path, body, ok) { method = ""  path = ""  body = ""  
 		raw = bytes_concat(raw, c)
 		have = len(raw) - (hdrend + 4) }
 	body = bytes_str(bytes_sub(raw, hdrend + 4, len(raw)))
+	auth = trim(header_of(raw, "x-essaim-token"))
+	if auth == "" { auth = bearer(header_of(raw, "authorization")) }
 	ok = 1 }
 
 func req_token(fd) (t) { t = "" }
@@ -235,7 +251,12 @@ func ratio_done(r) (d) { d = 0
 
 func daemon_serve(host, port, token, tick, peerport, timeout, progress) (err) { err = ""
 	mkdir_p(essaim_home())
-	srv := listen(port)
+	// listen_on, not listen: listen(port) hardcodes INADDR_ANY, so this daemon
+	// logged "listening on 127.0.0.1" and was in fact reachable from the whole
+	// network -- an unauthenticated API that accepts magnets and removes
+	// torrents. The bind address is the security boundary here, so it has to be
+	// the one the caller asked for.
+	srv := listen_on(host, port)
 	if srv < 0 { err = "cannot bind " + host + ":" + str(port)  return err }
 	socket_timeout(srv, tick)
 	// Before the registry is read, so a second daemon never gets far enough to
@@ -273,9 +294,14 @@ func daemon_serve(host, port, token, tick, peerport, timeout, progress) (err) { 
 	if progress == 1 { eprint("essaim: daemon listening on " + host + ":" + str(port) + " (" + str(len(recs)) + " torrents restored)") }
 	running := 1
 	for running == 1 { fd := accept(srv)
-		if fd >= 0 { method, path, body, ok := req_read(fd)
+		if fd >= 0 { method, path, body, auth, ok := req_read(fd)
 			if ok == 0 { close(fd) }
-			if ok == 1 { if path == "/_health" { respond(fd, 200, "{\"ok\":true,\"version\":\"" + VERSION + "\",\"jobs\":" + str(len(recs)) + ",\"pid\":" + str(0) + "}") }
+			// /_health stays open so a probe -- including this daemon's own
+			// liveness check on a home it may not own -- needs no credential.
+			allowed := 1
+			if ok == 1 { if path != "/_health" { allowed = authorized(auth, body, token) } }
+			if ok == 1 { if allowed == 0 { respond(fd, 401, "{\"ok\":false,\"error\":\"bad or missing token\"}") } }
+			if ok == 1 { if allowed == 1 { if path == "/_health" { respond(fd, 200, "{\"ok\":true,\"version\":\"" + VERSION + "\",\"jobs\":" + str(len(recs)) + ",\"pid\":" + str(0) + "}") }
 				if path == "/_shutdown" { if token_ok(body, token) == 0 { respond(fd, 401, "{\"ok\":false,\"error\":\"bad or missing token\"}") }
 					if token_ok(body, token) == 1 { respond(fd, 200, "{\"ok\":true,\"stopping\":true}")  running = 0 } }
 				if path == "/torrents" { if method == "GET" { respond(fd, 200, "{\"ok\":true,\"torrents\":" + recs_json(recs) + "}") }
@@ -344,7 +370,7 @@ func daemon_serve(host, port, token, tick, peerport, timeout, progress) (err) { 
 							jobs = job_remove(jobs, k)
 							seeders = seeder_remove(seeders, k)
 							registry_save(recs)
-							respond(fd, 200, "{\"ok\":true,\"removed\":\"" + id + "\"}") } } } } }
+							respond(fd, 200, "{\"ok\":true,\"removed\":\"" + id + "\"}") } } } } } }
 		// fold in anything the resolvers finished
 		drained := 1
 		for drained == 1 { drained = 0
@@ -428,6 +454,18 @@ func daemon_serve(host, port, token, tick, peerport, timeout, progress) (err) { 
 // require one.
 func token_ok(body, token) (ok) { ok = 0
 	if token == "" { ok = 1  return ok }
+	if unq(jget(body, ".token")) == token { ok = 1 } }
+
+// authorized gates the whole control surface, not just shutdown. Adding a
+// torrent, retargeting where it writes and removing one were all open to
+// anyone who could reach the port -- which, until listen_on, was everyone.
+//
+// No token configured means loopback-only and deliberately open: that is the
+// desktop case, and cmd_serve already refuses to bind anywhere else without
+// one. A token in the BODY still works so an old client keeps running.
+func authorized(auth, body, token) (ok) { ok = 0
+	if token == "" { ok = 1  return ok }
+	if auth != "" { if auth == token { ok = 1  return ok } }
 	if unq(jget(body, ".token")) == token { ok = 1 } }
 
 func rec_index(recs, id) (k) { k = 0 - 1

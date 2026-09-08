@@ -65,37 +65,40 @@ func main() { home := "/tmp/essaim-daemon-test"
 	go srv("127.0.0.1", 18790, "tok", done)
 	sleep(500)
 	base := "http://127.0.0.1:18790"
-	st, b, e := http_get_b(base + "/_health", 2000)
+	// The CLI has always sent this header; until the gate existed the daemon
+	// ignored it, so every route was open to anyone who could reach the port.
+	tokhdr := "X-Essaim-Token: tok"
+	st, b, e := http_do_b("GET", base + "/_health", "", tokhdr, 2000)
 	expect("health-status", str(st), "200")
 	expect("health-err", e, "")
 	expect("health-ok", str(contains(bytes_str(b), "\"ok\":true")), "true")
 	// unknown path is a 404, not a hang or a crash
-	st4, _, _ := http_get_b(base + "/torrents/nope", 2000)
+	st4, _, _ := http_do_b("GET", base + "/torrents/nope", "", tokhdr, 2000)
 	expect("missing-404", str(st4), "404")
 	// add requires a source
-	stb, _, _ := http_post_b(base + "/torrents", "{}", 3000)
+	stb, _, _ := http_do_b("POST", base + "/torrents", "{}", tokhdr, 3000)
 	expect("add-needs-source", str(stb), "400")
 	// a real add returns an id immediately, without resolving first
-	sta, ba, _ := http_post_b(base + "/torrents", "{\"source\":\"/nonexistent.torrent\",\"dir\":\"" + home + "\"}", 3000)
+	sta, ba, _ := http_do_b("POST", base + "/torrents", "{\"source\":\"/nonexistent.torrent\",\"dir\":\"" + home + "\"}", tokhdr, 3000)
 	expect("add-status", str(sta), "200")
 	id := unq(jget(bytes_str(ba), ".torrent.id"))
 	expect("add-returned-id", str(len(id)), "12")
 	expect("add-state-resolving", unq(jget(bytes_str(ba), ".torrent.state")), "resolving")
 	// and it is listed
-	stl, bl, _ := http_get_b(base + "/torrents", 2000)
+	stl, bl, _ := http_do_b("GET", base + "/torrents", "", tokhdr, 2000)
 	expect("list-status", str(stl), "200")
 	expect("list-has-one", unq(jget(bytes_str(bl), ".torrents[0].id")), id)
 	// an unresolvable source must land in "error", not spin forever
 	sleep(2500)
-	stg, bg, _ := http_get_b(base + "/torrents/" + id, 2000)
+	stg, bg, _ := http_do_b("GET", base + "/torrents/" + id, "", tokhdr, 2000)
 	expect("get-one", str(stg), "200")
 	expect("bad-source-errors", unq(jget(bytes_str(bg), ".torrent.state")), "error")
 	// PATCH adjusts in place. This record's job is not active (the source did
 	// not resolve), so the down_limit restart branch stays out of the way and
 	// what is under test here is purely the field merge.
-	stp404, _, _ := http_do_b("PATCH", base + "/torrents/nosuchid", "{\"seed\":1}", "", 2000)
+	stp404, _, _ := http_do_b("PATCH", base + "/torrents/nosuchid", "{\"seed\":1}", tokhdr, 2000)
 	expect("patch-unknown-404", str(stp404), "404")
-	stp, bp, _ := http_do_b("PATCH", base + "/torrents/" + id, "{\"seed\":1,\"up_limit\":512,\"down_limit\":256,\"ratio_limit_pct\":150}", "", 3000)
+	stp, bp, _ := http_do_b("PATCH", base + "/torrents/" + id, "{\"seed\":1,\"up_limit\":512,\"down_limit\":256,\"ratio_limit_pct\":150}", tokhdr, 3000)
 	expect("patch-status", str(stp), "200")
 	expect("patch-seed", unq(jget(bytes_str(bp), ".torrent.seed")), "true")
 	expect("patch-up", jget(bytes_str(bp), ".torrent.up_limit_kbs"), "512")
@@ -103,7 +106,7 @@ func main() { home := "/tmp/essaim-daemon-test"
 	expect("patch-ratio", jget(bytes_str(bp), ".torrent.ratio_limit_pct"), "150")
 	// the claim worth pinning: a PATCH touches ONLY the fields it carries, so
 	// changing one number never silently resets the others
-	stq, bq, _ := http_do_b("PATCH", base + "/torrents/" + id, "{\"ratio_limit_pct\":200}", "", 3000)
+	stq, bq, _ := http_do_b("PATCH", base + "/torrents/" + id, "{\"ratio_limit_pct\":200}", tokhdr, 3000)
 	expect("patch2-status", str(stq), "200")
 	expect("patch2-ratio-changed", jget(bytes_str(bq), ".torrent.ratio_limit_pct"), "200")
 	expect("patch2-up-kept", jget(bytes_str(bq), ".torrent.up_limit_kbs"), "512")
@@ -111,10 +114,25 @@ func main() { home := "/tmp/essaim-daemon-test"
 	expect("patch2-seed-kept", unq(jget(bytes_str(bq), ".torrent.seed")), "true")
 	// and it is durable: the registry on disk carries the patched values
 	expect("patch-persisted", str(contains(read_file(state_path()), "\"down_limit\":256")), "true")
+	// the WHOLE control surface is gated, not just shutdown: adding a torrent,
+	// retargeting where it writes and removing one were all open
+	stu, _, _ := http_do_b("GET", base + "/torrents", "", "", 2000)
+	expect("list-needs-token", str(stu), "401")
+	stv, _, _ := http_do_b("POST", base + "/torrents", "{\"source\":\"x\"}", "", 2000)
+	expect("add-needs-token", str(stv), "401")
+	stw, _, _ := http_do_b("DELETE", base + "/torrents/" + id, "", "", 2000)
+	expect("delete-needs-token", str(stw), "401")
+	stbad, _, _ := http_do_b("GET", base + "/torrents", "", "X-Essaim-Token: wrong", 2000)
+	expect("wrong-token-rejected", str(stbad), "401")
+	stbear, _, _ := http_do_b("GET", base + "/torrents", "", "Authorization: Bearer tok", 2000)
+	expect("bearer-accepted", str(stbear), "200")
+	// health stays open: a probe must not need a credential
+	sth, _, _ := http_do_b("GET", base + "/_health", "", "", 2000)
+	expect("health-open", str(sth), "200")
 	// shutdown is token-gated
-	stx, _, _ := http_post_b(base + "/_shutdown", "{\"token\":\"wrong\"}", 2000)
+	stx, _, _ := http_do_b("POST", base + "/_shutdown", "{\"token\":\"wrong\"}", tokhdr, 2000)
 	expect("shutdown-rejects", str(stx), "401")
-	sty, _, _ := http_post_b(base + "/_shutdown", "{\"token\":\"tok\"}", 2000)
+	sty, _, _ := http_do_b("POST", base + "/_shutdown", "{\"token\":\"tok\"}", tokhdr, 2000)
 	expect("shutdown-accepts", str(sty), "200")
 	expect("serve-returned", <-done, "")
 	system("rm -rf " + home)

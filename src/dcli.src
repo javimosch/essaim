@@ -89,6 +89,7 @@ func cmd_set(a) { id := arg_at(a, 2)
 	if len(fields) == 0 { fail(EXIT_ARGS, "nothing_to_set", "give at least one of --seed, --no-seed, --up-limit, --down-limit, --ratio-pct", []string{"essaim set <id> --no-seed"}) }
 	st, b, err := http_do_b("PATCH", url + "/torrents/" + id, "{" + join(fields, ",") + "}", auth_header(a), 20000)
 	if err != "" { fail(EXIT_NETWORK, "daemon_unreachable", err, []string{}) }
+	unauthorized(st, a)
 	if st == 404 { fail(EXIT_NOTFOUND, "not_found", "no torrent with id " + id, []string{"essaim status"}) }
 	if st != 200 { fail(EXIT_EXTERNAL, "set_failed", bytes_str(b), []string{}) }
 	emit(daemon_data(b)) }
@@ -113,6 +114,7 @@ func cmd_add(a) { src := arg_at(a, 2)
 	body := "{\"source\":\"" + jesc(src) + "\",\"dir\":\"" + jesc(flag_val(a, "--dir", ".")) + "\",\"seed\":" + str(seed) + ",\"up_limit\":" + flag_val(a, "--up-limit", "0") + ",\"down_limit\":" + flag_val(a, "--down-limit", "0") + ",\"ratio_limit_pct\":" + flag_val(a, "--ratio-pct", "0") + "}"
 	st, b, err := http_do_b("POST", url + "/torrents", body, auth_header(a), 20000)
 	if err != "" { fail(EXIT_NETWORK, "daemon_unreachable", err, []string{}) }
+	unauthorized(st, a)
 	if st != 200 { fail(EXIT_EXTERNAL, "add_failed", bytes_str(b), []string{}) }
 	emit(daemon_data(b)) }
 
@@ -124,6 +126,7 @@ func cmd_ls(a) { url := daemon_url(a)
 	if id != "" { if has_prefix(id, "--") == false { target = url + "/torrents/" + id } }
 	st, b, err := http_do_b("GET", target, "", auth_header(a), 10000)
 	if err != "" { fail(EXIT_NETWORK, "daemon_unreachable", err, []string{}) }
+	unauthorized(st, a)
 	if st == 404 { fail(EXIT_NOTFOUND, "not_found", "no torrent with id " + id, []string{"essaim status"}) }
 	emit(daemon_data(b)) }
 
@@ -132,8 +135,17 @@ func cmd_rm(a) { id := arg_at(a, 2)
 	url := daemon_url(a)
 	st, b, err := http_do_b("DELETE", url + "/torrents/" + id, "", auth_header(a), 10000)
 	if err != "" { fail(EXIT_NETWORK, "daemon_unreachable", err, []string{"essaim daemon start"}) }
+	unauthorized(st, a)
 	if st == 404 { fail(EXIT_NOTFOUND, "not_found", "no torrent with id " + id, []string{}) }
 	emit(daemon_data(b)) }
+
+// unauthorized is its own failure because the gate now covers every route, not
+// just shutdown. Without this a rejected token came back as {"ok":true} wrapping
+// the daemon's error and exit 0 -- a script could not tell a refusal from a
+// result.
+func unauthorized(st, a) { if st == 401 { t := flag_val(a, "--token", env("ESSAIM_TOKEN"))
+		if t == "" { fail(EXIT_VALIDATION, "token_required", "this daemon requires a token", []string{"essaim <cmd> --token <t>", "or set ESSAIM_TOKEN"}) }
+		fail(EXIT_VALIDATION, "bad_token", "the daemon rejected this token", []string{"check --token or ESSAIM_TOKEN"}) } }
 
 func auth_header(a) (h) { h = ""
 	t := flag_val(a, "--token", env("ESSAIM_TOKEN"))

@@ -240,9 +240,10 @@ TCP's own backpressure does the limiting. Pacing the requests instead would
 serialise the pipeline — slower for the same cap, and still no bound on a fast
 peer filling the receive buffer.
 
-One caveat: changing `--down-limit` on a **running** torrent restarts peer
-discovery, because a job's pacer is created with its interval when the job
-starts. Setting it at `add` time costs nothing.
+One caveat: `set --down-limit` on a **running** download is saved at once but
+takes effect the next time that torrent starts (a daemon restart, say). A job's
+pacer is created with its rate when the job starts, and the live one keeps it.
+Setting it at `add` time has no such gap.
 
 Two machines, no tracker and no DHT:
 

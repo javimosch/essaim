@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>essaim — agent-first BitTorrent client</title>
+<meta name="description" content="essaim: an agent-first BitTorrent client in one binary. JSON on stdout, semantic exit codes, an optional daemon so an agent never holds a blocking call. Written in pure MFL (machin).">
+<link rel="icon" type="image/png" href="favicon.png">
+<link rel="alternate" type="text/plain" title="llms.txt" href="llms.txt">
+<link rel="alternate" type="application/json" title="help-json" href="help.json">
+<meta property="og:title" content="essaim — agent-first BitTorrent client">
+<meta property="og:description" content="One binary, JSON on stdout, semantic exit codes, an optional daemon. Pure MFL.">
+<meta property="og:image" content="https://javimosch.github.io/essaim/logo.png">
+<style>
+:root{
+  --bg:#faf7f0; --panel:#f1ebdd; --ink:#1d1a15; --muted:#6b6254; --line:#ddd3bf;
+  --accent:#b86e00; --accent-ink:#1d1a15; --code:#efe7d4; --ok:#2f7a3b; --bad:#a3342a;
+  --mono:ui-monospace,"JetBrains Mono","SFMono-Regular",Menlo,Consolas,monospace;
+  --sans:ui-sans-serif,-apple-system,"Segoe UI",Inter,Roboto,sans-serif;
+}
+@media (prefers-color-scheme: dark){
+  :root{ --bg:#14120e; --panel:#1c1913; --ink:#ece5d6; --muted:#a39884; --line:#322c22;
+    --accent:#f0a830; --accent-ink:#14120e; --code:#221e17; --ok:#7cc88a; --bad:#ef8a7f; }
+}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink)}
+body{font:16px/1.6 var(--sans);-webkit-text-size-adjust:100%}
+a{color:var(--accent)}
+.wrap{max-width:920px;margin:0 auto;padding:0 16px}
+header{padding:40px 0 20px;border-bottom:1px solid var(--line)}
+.brand{display:flex;gap:18px;align-items:center}
+.brand img{width:84px;height:84px;flex:none}
+h1{font:700 40px/1.1 var(--mono);margin:0;letter-spacing:-1px}
+.tag{margin:6px 0 0;color:var(--muted);font-size:17px}
+.links{margin:18px 0 0;display:flex;flex-wrap:wrap;gap:8px}
+.links a{font:13px var(--mono);text-decoration:none;color:var(--ink);border:1px solid var(--line);padding:5px 10px;border-radius:6px;background:var(--panel)}
+.links a:hover{border-color:var(--accent)}
+.links .v{background:var(--accent);color:var(--accent-ink);border-color:var(--accent);font-weight:700}
+section{padding:28px 0;border-bottom:1px solid var(--line)}
+h2{font:700 13px var(--mono);text-transform:uppercase;letter-spacing:1.5px;color:var(--muted);margin:0 0 14px}
+h3{font:700 16px var(--sans);margin:22px 0 8px}
+p{margin:0 0 12px}
+code{font:14px var(--mono);background:var(--code);padding:1px 5px;border-radius:4px}
+pre{font:13.5px/1.55 var(--mono);background:var(--code);border:1px solid var(--line);border-radius:8px;padding:14px 16px;overflow-x:auto;margin:0 0 14px}
+pre code{background:none;padding:0;font-size:inherit}
+.c{color:var(--muted)}
+.agent{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:8px;padding:18px 18px 6px}
+.agent h2{color:var(--accent)}
+.grid{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:14px}
+.grid>*{min-width:0}
+section,.agent{min-width:0}
+@media (max-width:720px){.grid{grid-template-columns:minmax(0,1fr)} h1{font-size:32px} .brand img{width:64px;height:64px}}
+.card{border:1px solid var(--line);border-radius:8px;padding:14px 16px;background:var(--panel)}
+.card p:last-child{margin:0}
+.card b{font-family:var(--mono);font-size:14px}
+.tablewrap{overflow-x:auto;border:1px solid var(--line);border-radius:8px}
+table{border-collapse:collapse;width:100%;font-size:14px}
+th,td{text-align:left;padding:8px 12px;border-bottom:1px solid var(--line);vertical-align:top}
+th{font:700 12px var(--mono);text-transform:uppercase;letter-spacing:1px;color:var(--muted);background:var(--panel)}
+tr:last-child td{border-bottom:0}
+td code{white-space:nowrap}
+td.flags code{white-space:nowrap;display:inline-block;margin:0 4px 4px 0}
+.ok{color:var(--ok)} .bad{color:var(--bad)}
+footer{padding:28px 0 48px;color:var(--muted);font-size:14px}
+footer p{margin:0 0 8px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <div class="brand">
+    <img src="logo.png" alt="essaim logo" onerror="this.remove()">
+    <div>
+      <h1>essaim</h1>
+      <p class="tag">An agent-first BitTorrent client. One binary, JSON on stdout, semantic exit codes.</p>
+    </div>
+  </div>
+  <nav class="links">
+    <a class="v" href="https://github.com/javimosch/essaim/releases/latest">v<!-- gen:version -->0.5.2<!-- /gen:version --></a>
+    <a href="https://github.com/javimosch/essaim">GitHub</a>
+    <a href="llms.txt">llms.txt</a>
+    <a href="help.json">help.json</a>
+    <a href="#contract">output contract</a>
+    <a href="#commands">commands</a>
+  </nav>
+</header>
+
+<section class="agent" id="agents">
+  <h2>If you are an agent, start here</h2>
+  <p>Everything on this page is also available in a form you can parse. Read these instead of scraping HTML:</p>
+<pre><code>curl -fsSL https://javimosch.github.io/essaim/llms.txt    <span class="c"># this site, as text</span>
+curl -fsSL https://javimosch.github.io/essaim/help.json   <span class="c"># every command + flag, exit codes, env</span>
+essaim guide                                              <span class="c"># mental model + gotchas, version-exact</span></code></pre>
+  <p><code>help.json</code> is the verbatim output of <code>essaim help-json</code> for the release above, regenerated from the binary on every docs sync, so it cannot disagree with it. Prefer <code>essaim guide</code> on your own install: it is exact for the version you are actually running.</p>
+</section>
+
+<section id="install">
+  <h2>Install</h2>
+<pre><code>curl -fsSL -o essaim https://github.com/javimosch/essaim/releases/latest/download/essaim-linux-amd64
+curl -fsSL -o essaim.sha256 https://github.com/javimosch/essaim/releases/latest/download/essaim-linux-amd64.sha256
+sed 's/essaim-linux-amd64/essaim/' essaim.sha256 | sha256sum -c -   <span class="c"># must print: essaim: OK</span>
+chmod +x essaim &amp;&amp; ./essaim install                                <span class="c"># to ~/.local/bin, no sudo</span></code></pre>
+  <p>Linux x86-64, <b>glibc 2.34+</b>, dynamically linked against OpenSSL 3 (<code>libssl.so.3</code>, <code>libcrypto.so.3</code>). Not a static binary. <code>essaim update</code> self-updates by content hash with a smoke test and a <code>.bak</code>.</p>
+</section>
+
+<section id="loop">
+  <h2>The loop</h2>
+  <div class="grid">
+    <div class="card">
+      <h3 style="margin-top:0">Short job: foreground</h3>
+<pre><code>essaim info ./file.torrent            <span class="c"># size, files; downloads nothing</span>
+essaim get  ./file.torrent --dir ./dl
+echo $?                               <span class="c"># 0 complete · 105 rerun to resume</span></code></pre>
+      <p><code>get</code> blocks until it finishes. Fine for a minute, wrong for an hour.</p>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">Long job: the daemon</h3>
+<pre><code>essaim daemon start                   <span class="c"># loopback, idempotent</span>
+essaim add "magnet:?xt=urn:btih:…" --dir ./dl
+essaim status                         <span class="c"># poll; one row per torrent</span>
+essaim set &lt;id&gt; --down-limit 500
+essaim rm  &lt;id&gt;</code></pre>
+      <p><code>add</code> returns an id immediately, so you never hold a blocking call.</p>
+    </div>
+  </div>
+  <h3>Survive a reboot</h3>
+<pre><code>mkdir -p ~/.config/systemd/user
+essaim daemon unit &gt; ~/.config/systemd/user/essaim.service   <span class="c"># prints the unit; installs nothing</span>
+systemctl --user enable --now essaim
+loginctl enable-linger $USER</code></pre>
+</section>
+
+<section id="contract">
+  <h2>Output contract</h2>
+  <p>stdout is data, stderr is progress, and the exit code always equals <code>error.code</code> in the body.</p>
+<pre><code><span class="ok">{"ok":true, "version":"…", "data":{…}}</span>
+<span class="bad">{"ok":false,"version":"…", "error":{"code":92,"type":"not_found","message":"…","recoverable":false,"suggestions":[…]}}</span></code></pre>
+  <p>The payload is under <code>.data</code> for every command, including the daemon-backed <code>add</code>, <code>status</code>, <code>set</code> and <code>rm</code> (since 0.5.0). Two deliberate exceptions: <code>guide</code> answers under <code>.guide</code>, and a <code>get</code> that ends incomplete exits <code>105</code> carrying <b>both</b> <code>error</code> and <code>data</code>, because partial progress is still worth reading.</p>
+  <p><code>error.recoverable</code> is true only in the transient 100–109 band: that is the signal for whether a retry can help.</p>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>exit</th><th>meaning</th></tr></thead>
+    <tbody>
+<!-- gen:exit -->
+<tr><td><code>0</code></td><td>success</td></tr>
+<tr><td><code>80</code></td><td>input/validation</td></tr>
+<tr><td><code>82</code></td><td>validation error</td></tr>
+<tr><td><code>85</code></td><td>invalid value</td></tr>
+<tr><td><code>92</code></td><td>not found</td></tr>
+<tr><td><code>100</code></td><td>network unreachable</td></tr>
+<tr><td><code>105</code></td><td>external/incomplete</td></tr>
+<tr><td><code>110</code></td><td>internal</td></tr>
+<!-- /gen:exit -->
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section id="commands">
+  <h2>Commands</h2>
+  <p>Generated from <code>essaim help-json</code>.</p>
+  <div class="tablewrap">
+  <table>
+    <thead><tr><th>command</th><th>args</th><th>flags</th></tr></thead>
+    <tbody>
+<!-- gen:commands -->
+<tr><td><code>essaim search</code></td><td><code>query</code></td><td class="flags"><code>--cat &lt;all|movies|tv|anime|games&gt;</code> <code>--limit &lt;n&gt;</code> <code>--timeout &lt;ms&gt;</code> <code>--quiet</code> <code>--source &lt;names&gt;</code></td></tr>
+<tr><td><code>essaim sources</code></td><td><span class="c">—</span></td><td class="flags"><span class="c">—</span></td></tr>
+<tr><td><code>essaim serve</code></td><td><span class="c">—</span></td><td class="flags"><code>--host &lt;ip&gt;</code> <code>--port &lt;n&gt;</code> <code>--token &lt;t&gt;</code> <code>--peer-port &lt;n&gt;</code> <code>--quiet</code></td></tr>
+<tr><td><code>essaim daemon</code></td><td><code>start|stop|status|unit</code></td><td class="flags"><code>--host &lt;ip&gt;</code> <code>--port &lt;n&gt;</code> <code>--token &lt;t&gt;</code> <code>--json</code></td></tr>
+<tr><td><code>essaim add</code></td><td><code>magnet|torrent|url</code></td><td class="flags"><code>--dir &lt;path&gt;</code> <code>--seed</code> <code>--up-limit &lt;KB/s&gt;</code> <code>--down-limit &lt;KB/s&gt;</code> <code>--ratio-pct &lt;n&gt;</code> <code>--port &lt;n&gt;</code> <code>--token &lt;t&gt;</code></td></tr>
+<tr><td><code>essaim status</code></td><td><code>[id]</code></td><td class="flags"><code>--port &lt;n&gt;</code> <code>--token &lt;t&gt;</code></td></tr>
+<tr><td><code>essaim rm</code></td><td><code>id</code></td><td class="flags"><code>--port &lt;n&gt;</code> <code>--token &lt;t&gt;</code></td></tr>
+<tr><td><code>essaim set</code></td><td><code>id</code></td><td class="flags"><code>--seed</code> <code>--no-seed</code> <code>--up-limit &lt;KB/s&gt;</code> <code>--down-limit &lt;KB/s&gt;</code> <code>--ratio-pct &lt;n&gt;</code> <code>--port &lt;n&gt;</code> <code>--token &lt;t&gt;</code></td></tr>
+<tr><td><code>essaim seed</code></td><td><code>torrent|magnet</code></td><td class="flags"><code>--dir &lt;path&gt;</code> <code>--port &lt;n&gt;</code> <code>--up-limit &lt;KB/s&gt;</code> <code>--duration &lt;ms&gt;</code> <code>--no-announce</code> <code>--quiet</code></td></tr>
+<tr><td><code>essaim peers</code></td><td><code>magnet|infohash|torrent</code></td><td class="flags"><code>--no-dht</code> <code>--no-trackers</code> <code>--timeout &lt;ms&gt;</code> <code>--quiet</code></td></tr>
+<tr><td><code>essaim get</code></td><td><code>source</code></td><td class="flags"><code>--dir &lt;path&gt;</code> <code>--port &lt;n&gt;</code> <code>--timeout &lt;ms&gt;</code> <code>--deadline &lt;ms&gt;</code> <code>--quiet</code> <code>--no-dht</code> <code>--peer &lt;ip:port&gt;</code> <code>--seed</code> <code>--seed-duration &lt;ms&gt;</code> <code>--up-limit &lt;KB/s&gt;</code> <code>--down-limit &lt;KB/s&gt;</code></td></tr>
+<tr><td><code>essaim info</code></td><td><code>source</code></td><td class="flags"><code>--fetch</code> <code>--no-dht</code> <code>--quiet</code></td></tr>
+<tr><td><code>essaim guide</code></td><td><span class="c">—</span></td><td class="flags"><code>--human</code></td></tr>
+<tr><td><code>essaim help-json</code></td><td><span class="c">—</span></td><td class="flags"><span class="c">—</span></td></tr>
+<tr><td><code>essaim version</code></td><td><span class="c">—</span></td><td class="flags"><span class="c">—</span></td></tr>
+<tr><td><code>essaim install</code></td><td><span class="c">—</span></td><td class="flags"><code>--dir &lt;path&gt;</code></td></tr>
+<tr><td><code>essaim uninstall</code></td><td><span class="c">—</span></td><td class="flags"><code>--dir &lt;path&gt;</code></td></tr>
+<tr><td><code>essaim update</code></td><td><span class="c">—</span></td><td class="flags"><code>--check</code></td></tr>
+<tr><td><code>essaim feedback</code></td><td><code>message</code></td><td class="flags"><code>--kind &lt;bug|idea|praise|note&gt;</code> <code>--context &lt;text&gt;</code> <code>--reporter &lt;who&gt;</code></td></tr>
+<!-- /gen:commands -->
+    </tbody>
+  </table>
+  </div>
+  <p style="margin-top:12px">Environment: <!-- gen:env --><code>HOME</code>, <code>ESSAIM_HOME</code>, <code>ESSAIM_TOKEN</code>, <code>FEEDBACK_RELAY</code>, <code>ESSAIM_SOURCES</code><!-- /gen:env -->.</p>
+</section>
+
+<section id="behaviour">
+  <h2>Behaviour worth knowing</h2>
+  <div class="grid">
+    <div class="card"><p><b>The files are the state.</b> There is no progress journal. A rerun re-verifies what is on disk and resumes; a verified piece is never fetched twice.</p></div>
+    <div class="card"><p><b>Nothing is trusted unverified.</b> Every piece is checked against the SHA-1 the torrent committed to. A bad piece is discarded and refetched.</p></div>
+    <div class="card"><p><b>0 pieces is not a stall.</b> A fresh torrent can sit at 0 for ~30&nbsp;s while trackers answer and the DHT lookup runs. Poll again before concluding anything.</p></div>
+    <div class="card"><p><b>Magnets need no tracker.</b> Peers come from the DHT (BEP 5), and file metadata from the swarm (BEP 9). Slower to start; <code>--no-dht</code> disables it.</p></div>
+    <div class="card"><p><b>Seeding is opt-in.</b> No port is opened and nothing is uploaded unless you run <code>seed</code> or pass <code>--seed</code>.</p></div>
+    <div class="card"><p><b>Caps are global.</b> <code>--up-limit</code> and <code>--down-limit</code> (KB/s) bound the total across every peer. <code>set --down-limit</code> on a running download is saved at once but applies the next time that torrent starts, e.g. after a daemon restart.</p></div>
+    <div class="card"><p><b>Loopback by default.</b> The daemon API binds to 127.0.0.1. Binding wider with <code>--host</code> also requires <code>--token</code>, because that API accepts magnets.</p></div>
+    <div class="card"><p><b>A human can watch.</b> <a href="https://github.com/javimosch/essaim-ui">essaim-ui</a> is a separate binary that drives this daemon's API from a browser. Offer it to the person you work for rather than handing them JSON.</p></div>
+    <div class="card"><p><b>No telemetry.</b> Deliberately none: what someone downloads is exactly what usage data must never touch. There is nothing to opt out of.</p></div>
+  </div>
+</section>
+
+<section id="search">
+  <h2>Search</h2>
+<pre><code>essaim search "apollo 11 audio" --limit 10
+essaim sources                               <span class="c"># what is compiled in, and what is enabled</span></code></pre>
+  <p>The only source enabled by default is <a href="https://archive.org">archive.org</a>. Sources are a declarative table compiled into the binary: each one is a URL template plus the JSON paths or patterns to read, not bespoke parsing code.</p>
+</section>
+
+<section id="why">
+  <h2>Why it exists</h2>
+  <p>essaim is an experiment to dogfood <a href="https://github.com/javimosch/machin">machin</a> (MFL) on something demanding: a binary wire protocol, real concurrency and real network failure. Bencode, the peer wire protocol, UDP and HTTP trackers, the DHT, metadata exchange and SHA-1 verification are all pure MFL, and the whole thing builds under <code>machin build --race-safe</code>, which proves the absence of data races rather than testing for them. It drove two builtins into the language: UDP sockets and positional file writes.</p>
+</section>
+
+<footer>
+  <p><b>No warranty, no responsibility.</b> essaim is provided as-is, with no responsibility taken for how it is used or for anything a third-party index returns. You are responsible for what you download and for complying with the law and the terms of any service you point it at.</p>
+  <p>Designed and written with <a href="https://claude.com/claude-code">Claude Code</a>, which holds authorship of essentially all of the repository. MIT licence.</p>
+</footer>
+
+</div>
+</body>
+</html>

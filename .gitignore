@@ -2,3 +2,5 @@ essaim
 essaim.mfl
 *.o
 dist/
+docs/gen/.cache/
+docs/gen/out/

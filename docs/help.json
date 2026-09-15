@@ -1,0 +1,223 @@
+{
+  "version": "0.5.2",
+  "output": "json",
+  "commands": {
+    "search": {
+      "args": [
+        "query"
+      ],
+      "flags": [
+        "--cat <all|movies|tv|anime|games>",
+        "--limit <n>",
+        "--timeout <ms>",
+        "--quiet",
+        "--source <names>"
+      ],
+      "auth": false
+    },
+    "sources": {
+      "args": [],
+      "flags": [],
+      "auth": false
+    },
+    "serve": {
+      "args": [],
+      "flags": [
+        "--host <ip>",
+        "--port <n>",
+        "--token <t>",
+        "--peer-port <n>",
+        "--quiet"
+      ],
+      "auth": false
+    },
+    "daemon": {
+      "args": [
+        "start|stop|status|unit"
+      ],
+      "flags": [
+        "--host <ip>",
+        "--port <n>",
+        "--token <t>",
+        "--json"
+      ],
+      "auth": false
+    },
+    "add": {
+      "args": [
+        "magnet|torrent|url"
+      ],
+      "flags": [
+        "--dir <path>",
+        "--seed",
+        "--up-limit <KB/s>",
+        "--down-limit <KB/s>",
+        "--ratio-pct <n>",
+        "--port <n>",
+        "--token <t>"
+      ],
+      "auth": false
+    },
+    "status": {
+      "args": [
+        "[id]"
+      ],
+      "flags": [
+        "--port <n>",
+        "--token <t>"
+      ],
+      "auth": false
+    },
+    "rm": {
+      "args": [
+        "id"
+      ],
+      "flags": [
+        "--port <n>",
+        "--token <t>"
+      ],
+      "auth": false
+    },
+    "set": {
+      "args": [
+        "id"
+      ],
+      "flags": [
+        "--seed",
+        "--no-seed",
+        "--up-limit <KB/s>",
+        "--down-limit <KB/s>",
+        "--ratio-pct <n>",
+        "--port <n>",
+        "--token <t>"
+      ],
+      "auth": false
+    },
+    "seed": {
+      "args": [
+        "torrent|magnet"
+      ],
+      "flags": [
+        "--dir <path>",
+        "--port <n>",
+        "--up-limit <KB/s>",
+        "--duration <ms>",
+        "--no-announce",
+        "--quiet"
+      ],
+      "auth": false
+    },
+    "peers": {
+      "args": [
+        "magnet|infohash|torrent"
+      ],
+      "flags": [
+        "--no-dht",
+        "--no-trackers",
+        "--timeout <ms>",
+        "--quiet"
+      ],
+      "auth": false
+    },
+    "get": {
+      "args": [
+        "source"
+      ],
+      "flags": [
+        "--dir <path>",
+        "--port <n>",
+        "--timeout <ms>",
+        "--deadline <ms>",
+        "--quiet",
+        "--no-dht",
+        "--peer <ip:port>",
+        "--seed",
+        "--seed-duration <ms>",
+        "--up-limit <KB/s>",
+        "--down-limit <KB/s>"
+      ],
+      "auth": false
+    },
+    "info": {
+      "args": [
+        "source"
+      ],
+      "flags": [
+        "--fetch",
+        "--no-dht",
+        "--quiet"
+      ],
+      "auth": false
+    },
+    "guide": {
+      "args": [],
+      "flags": [
+        "--human"
+      ],
+      "auth": false
+    },
+    "help-json": {
+      "args": [],
+      "flags": [],
+      "auth": false
+    },
+    "version": {
+      "args": [],
+      "flags": [],
+      "auth": false
+    },
+    "install": {
+      "args": [],
+      "flags": [
+        "--dir <path>"
+      ],
+      "auth": false
+    },
+    "uninstall": {
+      "args": [],
+      "flags": [
+        "--dir <path>"
+      ],
+      "auth": false
+    },
+    "update": {
+      "args": [],
+      "flags": [
+        "--check"
+      ],
+      "auth": false
+    },
+    "feedback": {
+      "args": [
+        "message"
+      ],
+      "flags": [
+        "--kind <bug|idea|praise|note>",
+        "--context <text>",
+        "--reporter <who>"
+      ],
+      "auth": false
+    }
+  },
+  "exit_codes": {
+    "0": "success",
+    "80": "input/validation",
+    "82": "validation error",
+    "85": "invalid value",
+    "92": "not found",
+    "100": "network unreachable",
+    "105": "external/incomplete",
+    "110": "internal"
+  },
+  "env": [
+    "HOME",
+    "ESSAIM_HOME",
+    "ESSAIM_TOKEN",
+    "FEEDBACK_RELAY",
+    "ESSAIM_SOURCES"
+  ],
+  "telemetry": "none -- essaim sends no usage data by design",
+  "see_also": [
+    "guide"
+  ]
+}

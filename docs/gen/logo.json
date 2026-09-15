@@ -1,0 +1,7 @@
+{
+  "name": "essaim_logo", "out": "docs/gen/out", "prefix": "logo",
+  "grid": 2, "size": 512, "chroma": "auto", "fit": "square", "pad": 0.08,
+  "sheets": "docs/sheets",
+  "names": ["a", "b", "c", "d"],
+  "prompt": "one square image: a 2x2 grid of four DIFFERENT logo mark concepts for a command-line file-sharing tool named 'essaim' (French for 'swarm'). Each concept is a single bold, flat, geometric vector emblem centred in its own cell: a tight swarm of small hexagonal cells or dots converging into one shape, evoking many peers assembling one file piece by piece. Minimal, modern, two or three colours only: warm amber honey gold and deep charcoal ink. Thick clean shapes that stay readable at 32 pixels, no gradients, no shadows, no 3D, no mascots, no bees with faces. Every cell is filled edge to edge with a FLAT PURE MAGENTA background, hex FF00FF, absolutely uniform with no gradient and no vignette. No text, no letters, no numbers, no watermark, no borders or gutters between the cells."
+}

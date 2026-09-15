@@ -1,0 +1,102 @@
+# essaim
+
+> An agent-first BitTorrent client in one binary: JSON on stdout, progress on stderr, semantic exit codes, and an optional loopback daemon so an agent never holds a blocking call. Written in pure MFL (machin). Version: 0.5.2
+
+- Site: https://javimosch.github.io/essaim/
+- Repo: https://github.com/javimosch/essaim (MIT)
+- Machine-readable command reference: https://javimosch.github.io/essaim/help.json (verbatim `essaim help-json`)
+- Version-exact mental model and gotchas: run `essaim guide` on your install (JSON; `--human` for text)
+
+## Install
+
+Linux x86-64, glibc 2.34+, dynamically linked against OpenSSL 3 (libssl.so.3, libcrypto.so.3). Not static.
+
+```
+curl -fsSL -o essaim https://github.com/javimosch/essaim/releases/latest/download/essaim-linux-amd64
+curl -fsSL -o essaim.sha256 https://github.com/javimosch/essaim/releases/latest/download/essaim-linux-amd64.sha256
+sed 's/essaim-linux-amd64/essaim/' essaim.sha256 | sha256sum -c -
+chmod +x essaim && ./essaim install      # to ~/.local/bin, no sudo
+```
+
+## Output contract
+
+- Success: `{"ok":true,"version":"...","data":{...}}`, exit 0.
+- Failure: `{"ok":false,"version":"...","error":{"code":N,"type":"...","message":"...","recoverable":bool,"suggestions":[...]}}`, exit N. The exit code always equals `error.code`.
+- Payload is under `.data` for every command, including daemon-backed add/status/set/rm (since 0.5.0; before that they printed the daemon's raw reply at top level).
+- Exceptions: `guide` answers under `.guide`; a `get` that ends incomplete exits 105 with BOTH `error` and `data`.
+- `error.recoverable` is true only for 100-109: the signal for whether a retry can help.
+
+Exit codes:
+<!-- gen:exit -->
+- `0` success
+- `80` input/validation
+- `82` validation error
+- `85` invalid value
+- `92` not found
+- `100` network unreachable
+- `105` external/incomplete
+- `110` internal
+<!-- /gen:exit -->
+
+## The loop
+
+Short job (blocks until done):
+```
+essaim info ./file.torrent          # size and files, downloads nothing
+essaim get  ./file.torrent --dir ./dl
+# exit 0 = complete; exit 105 = incomplete: run the SAME command again, verified pieces are kept
+```
+
+Long job (never block):
+```
+essaim daemon start                 # loopback 127.0.0.1, idempotent
+essaim add "magnet:?xt=urn:btih:..." --dir ./dl [--seed] [--up-limit KB/s] [--down-limit KB/s] [--ratio-pct N]
+essaim status [id]                  # poll: .data.torrents[] or .data.torrent
+essaim set <id> [--seed|--no-seed] [--up-limit KB/s] [--down-limit KB/s] [--ratio-pct N]   # patches only fields passed
+essaim rm <id>
+essaim daemon stop
+```
+
+Reboot survival: `essaim daemon unit` PRINTS a systemd user unit (installs nothing); then `systemctl --user enable --now essaim` and `loginctl enable-linger $USER`.
+
+## Gotchas
+
+- A freshly added torrent sits in `resolving`, then at 0 pieces, for up to ~30s during tracker + DHT discovery. That is not a stall; poll again.
+- The files on disk ARE the resume state. No journal. Moving or truncating them changes what a rerun downloads.
+- `--deadline` bounds a whole `get` (default 600000 ms); `--timeout` bounds one socket operation (default 15000 ms). A slow swarm needs a bigger `--deadline`.
+- A bare magnet with no trackers works via the DHT, slower to start; `--no-dht` disables it.
+- Seeding is opt-in: no port opened, nothing uploaded, unless `seed` or `--seed`.
+- `--up-limit` / `--down-limit` are GLOBAL across all peers, in KB/s. A burst of 4 blocks is allowed. `set --down-limit` on a RUNNING download is saved immediately but only takes effect the next time that torrent starts (e.g. daemon restart): the live pacer keeps its old rate.
+- The daemon API binds loopback; `--host` additionally requires `--token` (or ESSAIM_TOKEN).
+- `ESSAIM_HOME` (default ~/.essaim) holds the daemon registry and .torrent cache. Set it in tests.
+- Search: only archive.org is enabled by default. `essaim sources` lists what is compiled in.
+- A human watching? essaim-ui (https://github.com/javimosch/essaim-ui) is a separate binary that drives the daemon API from a browser. Offer it instead of showing them JSON.
+- No telemetry, by design.
+
+## Commands
+
+<!-- gen:commands -->
+- `essaim search query --cat <all|movies|tv|anime|games> --limit <n> --timeout <ms> --quiet --source <names>`
+- `essaim sources`
+- `essaim serve --host <ip> --port <n> --token <t> --peer-port <n> --quiet`
+- `essaim daemon start|stop|status|unit --host <ip> --port <n> --token <t> --json`
+- `essaim add magnet|torrent|url --dir <path> --seed --up-limit <KB/s> --down-limit <KB/s> --ratio-pct <n> --port <n> --token <t>`
+- `essaim status [id] --port <n> --token <t>`
+- `essaim rm id --port <n> --token <t>`
+- `essaim set id --seed --no-seed --up-limit <KB/s> --down-limit <KB/s> --ratio-pct <n> --port <n> --token <t>`
+- `essaim seed torrent|magnet --dir <path> --port <n> --up-limit <KB/s> --duration <ms> --no-announce --quiet`
+- `essaim peers magnet|infohash|torrent --no-dht --no-trackers --timeout <ms> --quiet`
+- `essaim get source --dir <path> --port <n> --timeout <ms> --deadline <ms> --quiet --no-dht --peer <ip:port> --seed --seed-duration <ms> --up-limit <KB/s> --down-limit <KB/s>`
+- `essaim info source --fetch --no-dht --quiet`
+- `essaim guide --human`
+- `essaim help-json`
+- `essaim version`
+- `essaim install --dir <path>`
+- `essaim uninstall --dir <path>`
+- `essaim update --check`
+- `essaim feedback message --kind <bug|idea|praise|note> --context <text> --reporter <who>`
+<!-- /gen:commands -->
+
+## Status
+
+An experiment to dogfood machin (MFL). Provided as-is: no warranty and no responsibility taken for how it is used or for anything a third-party index returns. Designed and written with Claude Code, which holds authorship of essentially all of the repository.

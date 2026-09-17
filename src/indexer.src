@@ -10,10 +10,12 @@
 // and a magnet built from the infohash. The infohash is the only field that
 // matters for downloading -- everything else is presentation.
 
-// filter "local" means the index ignores the query and returns a firehose, so
-// essaim narrows the rows itself. EZTV's API only filters by IMDb id, and
-// SubsPlease's feed has no query at all -- without this they would answer every
-// search with the same latest-releases list.
+// filter "local" means the index does not narrow to the query by itself, so
+// essaim narrows the rows. EZTV's API only filters by IMDb id and SubsPlease's
+// feed has no query at all -- without it they answer every search with the same
+// latest-releases list. It is on for the RANKED indexes too: apibay ranks by
+// relevance but does not drop rows that miss a term, so "underground" and
+// "underground 2" came back identical, 62 rows each, in the same order.
 type Source struct { name string  kind string  cat string  url string  mode string  probe string  f_name string  f_hash string  f_size string  f_seed string  f_link string  filter string  enabled int }
 
 // f_link lets a source return a .torrent URL instead of an infohash. Not every
@@ -33,12 +35,19 @@ func default_trackers() (t) { t = []string{"udp://tracker.opentrackr.org:1337/an
 // (or add your own row) and rebuild. essaim takes no position on, and no
 // responsibility for, what any third-party index returns.
 func sources_default() (s) { s = []Source{}
-	s = append(s, Source{name: "piratebay", kind: "json", cat: "all", url: "https://apibay.org/q.php?q={q}", mode: "index", probe: ".[{i}].name", f_name: ".[{i}].name", f_hash: ".[{i}].info_hash", f_size: ".[{i}].size", f_seed: ".[{i}].seeders", enabled: 0})
-	s = append(s, Source{name: "piratebay-games", kind: "json", cat: "games", url: "https://apibay.org/q.php?q={q}&cat=400", mode: "index", probe: ".[{i}].name", f_name: ".[{i}].name", f_hash: ".[{i}].info_hash", f_size: ".[{i}].size", f_seed: ".[{i}].seeders", enabled: 0})
+	s = append(s, Source{name: "piratebay", kind: "json", cat: "all", url: "https://apibay.org/q.php?q={q}", mode: "index", probe: ".[{i}].name", f_name: ".[{i}].name", f_hash: ".[{i}].info_hash", f_size: ".[{i}].size", f_seed: ".[{i}].seeders", filter: "local", enabled: 0})
+	s = append(s, Source{name: "piratebay-games", kind: "json", cat: "games", url: "https://apibay.org/q.php?q={q}&cat=400", mode: "index", probe: ".[{i}].name", f_name: ".[{i}].name", f_hash: ".[{i}].info_hash", f_size: ".[{i}].size", f_seed: ".[{i}].seeders", filter: "local", enabled: 0})
 	s = append(s, Source{name: "yts", kind: "json", cat: "movies", url: "https://yts.mx/api/v2/list_movies.json?limit=30&query_term={q}", mode: "index", probe: ".data.movies[{i}].title_long", f_name: ".data.movies[{i}].title_long", f_hash: ".data.movies[{i}].torrents[0].hash", f_size: ".data.movies[{i}].torrents[0].size_bytes", f_seed: ".data.movies[{i}].torrents[0].seeds", enabled: 0})
 	s = append(s, Source{name: "nyaa", kind: "rss", cat: "anime", url: "https://nyaa.si/?page=rss&q={q}", mode: "item", probe: "<title>([^<]*)</title>", f_name: "<title>([^<]*)</title>", f_hash: "<nyaa:infoHash>([0-9a-fA-F]{40})</nyaa:infoHash>", f_size: "<nyaa:size>([^<]*)</nyaa:size>", f_seed: "<nyaa:seeders>([0-9]+)</nyaa:seeders>", enabled: 0})
 	s = append(s, Source{name: "subsplease", kind: "rss", cat: "anime", url: "https://subsplease.org/rss/?t&r=1080p", mode: "item", probe: "<title>([^<]*)</title>", f_name: "<title>([^<]*)</title>", f_hash: "btih:([0-9a-fA-F]{40})", f_size: "<size>([^<]*)</size>", f_seed: "<seeders>([0-9]+)</seeders>", filter: "local", enabled: 0})
-	s = append(s, Source{name: "archive", kind: "json", cat: "all", url: "https://archive.org/services/search/v1/scrape?q=format%3A%22Archive+BitTorrent%22+AND+%28{q}%29&count=100&fields=identifier,item_size", mode: "index", probe: ".items[{i}].identifier", f_name: ".items[{i}].identifier", f_hash: "", f_size: ".items[{i}].item_size", f_seed: "", f_link: "https://archive.org/download/{v}/{v}_archive.torrent", enabled: 1})
+	// archive.org used to be queried through services/search/v1/scrape. That
+	// endpoint IGNORES the AND (...) clause -- a nonsense term returns the same
+	// 88-million-item total as no query at all -- and then returns the first
+	// rows in identifier order, so every search answered with the same
+	// alphabetical junk starting at "0-...". advancedsearch.php honours the
+	// query. filter "local" stays on as a backstop, because what gets shown is
+	// the identifier and an identifier is not always the title.
+	s = append(s, Source{name: "archive", kind: "json", cat: "all", url: "https://archive.org/advancedsearch.php?q=format%3A%22Archive+BitTorrent%22+AND+%28{q}%29&fl%5B%5D=identifier&fl%5B%5D=item_size&rows=100&page=1&output=json", mode: "index", probe: ".response.docs[{i}].identifier", f_name: ".response.docs[{i}].identifier", f_hash: "", f_size: ".response.docs[{i}].item_size", f_seed: "", f_link: "https://archive.org/download/{v}/{v}_archive.torrent", filter: "local", enabled: 1})
 	s = append(s, Source{name: "eztv", kind: "json", cat: "tv", url: "https://eztvx.to/api/get-torrents?limit=50&keywords={q}", mode: "index", probe: ".torrents[{i}].title", f_name: ".torrents[{i}].title", f_hash: ".torrents[{i}].hash", f_size: ".torrents[{i}].size_bytes", f_seed: ".torrents[{i}].seeds", filter: "local", enabled: 0}) }
 
 type Hit struct { source string  name string  infohash string  size int  seeders int  magnet string  torrent string }
@@ -97,15 +106,79 @@ func scan_json(s, txt, q, limit) (out) { out = []Hit{}
 				out = append(out, h) } }
 		i = i + 1 } }
 
-// q_match narrows a firehose source locally: every whitespace-separated term of
-// the query must appear in the name, case-insensitively.
+// norm_sep lowercases and turns separators into spaces, so "Need.For.Speed_II-SE"
+// and "Need For Speed II SE" tokenize the same. Index names are punctuation
+// soup: dots, underscores, brackets and release-group junk.
+func norm_sep(s) (out) { out = to_lower(s)
+	seps := []string{".", "_", "-", "+", "(", ")", "[", "]", "{", "}", ",", ":", ";", "/", "!", "?", "*", "|", "~", "&", "'", "\""}
+	i := 0
+	for i < len(seps) { out = replace(out, seps[i], " ")
+		i = i + 1 } }
+
+// roman_alt folds a bare roman numeral to digits and back, so "need for speed 2"
+// and "need for speed II" are the same search -- without it the digits query
+// returned zero of the eight II releases that exist.
+//
+// i, v and x are deliberately NOT folded: as standalone tokens they are far more
+// often a version marker or a release-group letter than a numeral, and folding
+// them made "v" match every "5". Past ten, titles use digits anyway.
+func roman_alt(t) (alt) { alt = ""
+	r := []string{"ii", "iii", "iv", "vi", "vii", "viii", "ix"}
+	d := []string{"2", "3", "4", "6", "7", "8", "9"}
+	i := 0
+	for i < len(r) { if t == r[i] { alt = d[i]  return alt }
+		if t == d[i] { alt = r[i]  return alt }
+		i = i + 1 } }
+
+// glue concatenates the query terms, optionally folding each numeral to its
+// other form, so a glued name matches whichever way the title was written.
+func glue(terms, fold) (out) { out = ""
+	i := 0
+	for i < len(terms) { t := terms[i]
+		if fold == 1 { alt := roman_alt(t)
+			if alt != "" { t = alt } }
+		out = out + t
+		i = i + 1 } }
+
+func has_token(tokens, t) (yes) { yes = 0
+	i := 0
+	for i < len(tokens) { if tokens[i] == t { yes = 1  return yes }
+		i = i + 1 } }
+
+// q_match narrows a source locally: every term of the query must be present in
+// the name.
+//
+// A term matches as a WHOLE TOKEN, not as a substring. Substring matching was
+// the old behaviour and it cannot tell "Underground 2" from "Underground
+// (2003)" -- the "2" is inside "2003" -- which is exactly how one query
+// answered with the other game's releases. Long terms additionally match when
+// glued into the name, because identifier-based indexes write
+// "needforspeedii" with no separators at all.
 func q_match(filter, name, q) (m) { m = 1
 	if filter != "local" { return m }
 	if q == "" { return m }
-	lname := to_lower(name)
-	terms := split(to_lower(q), " ")
+	nname := norm_sep(name)
+	tokens := split(nname, " ")
+	flat := replace(nname, " ", "")
+	terms := split(norm_sep(q), " ")
+	// A name written with no separators at all ("NeedForSpeedII") is ONE token,
+	// so short terms like "for" can never match it term-by-term. For that case
+	// only, test the whole query glued.
+	//
+	// ONLY for that case: applied to a name that does tokenize, the glued test
+	// re-opens the bug it is next to, because "...underground2" is a prefix of
+	// "...underground2003" and the 2003 game comes back for a query that asked
+	// for the 2004 one.
+	if len(tokens) == 1 { if contains(flat, glue(terms, 0)) == true { return m }
+		if contains(flat, glue(terms, 1)) == true { return m } }
 	i := 0
-	for i < len(terms) { if terms[i] != "" { if contains(lname, terms[i]) == false { m = 0  return m } }
+	for i < len(terms) { t := terms[i]
+		if t != "" { ok := 0
+			if has_token(tokens, t) == 1 { ok = 1 }
+			if ok == 0 { if len(t) >= 4 { if contains(flat, t) == true { ok = 1 } } }
+			if ok == 0 { alt := roman_alt(t)
+				if alt != "" { if has_token(tokens, alt) == 1 { ok = 1 } } }
+			if ok == 0 { m = 0  return m } }
 		i = i + 1 } }
 
 // jstr_at reads a path and strips the quotes json_get leaves on a string token,

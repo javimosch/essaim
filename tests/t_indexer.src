@@ -10,13 +10,29 @@ func fx_apibay() (s) { s = "[{\"name\":\"Ubuntu 22.04\",\"info_hash\":\"2C6B6858
 
 func fx_nyaa() (s) { s = "<rss><channel><item><title>[Grp] One Piece 1177</title><nyaa:infoHash>45008e48c8800b7d7643337b2e70a634e4c69f6a</nyaa:infoHash><nyaa:size>1.4 GiB</nyaa:size><nyaa:seeders>42</nyaa:seeders></item><item><title>Unrelated Show 01</title><nyaa:infoHash>1111111111111111111111111111111111111111</nyaa:infoHash><nyaa:seeders>7</nyaa:seeders></item></channel></rss>" }
 
-func fx_archive() (s) { s = "{\"items\":[{\"identifier\":\"apollo-11\",\"item_size\":7158024},{\"identifier\":\"gemini-4\",\"item_size\":123}],\"total\":2}" }
+// advancedsearch.php's shape, which is what the archive row queries now. The
+// old services/search/v1/scrape endpoint ignored the query entirely.
+func fx_archive() (s) { s = "{\"response\":{\"numFound\":2,\"docs\":[{\"identifier\":\"apollo-11\",\"item_size\":7158024},{\"identifier\":\"gemini-4\",\"item_size\":123}]}}" }
+
+// A firehose: what an index returns when it ranks but does not narrow. Every
+// name here is a real shape seen from apibay for one franchise.
+func fx_firehose() (s) { s = "[" +
+	"{\"name\":\"Need For Speed II SE PC\",\"info_hash\":\"1111111111111111111111111111111111111111\",\"size\":\"100\",\"seeders\":\"4\"}," +
+	"{\"name\":\"Need.For.Speed.Underground.2-RELOADED\",\"info_hash\":\"2222222222222222222222222222222222222222\",\"size\":\"200\",\"seeders\":\"10\"}," +
+	"{\"name\":\"Need for Speed: Underground  (2003) - Rjaa\",\"info_hash\":\"3333333333333333333333333333333333333333\",\"size\":\"300\",\"seeders\":\"31\"}," +
+	"{\"name\":\"NeedForSpeedII\",\"info_hash\":\"4444444444444444444444444444444444444444\",\"size\":\"400\",\"seeders\":\"1\"}," +
+	"{\"name\":\"Bach Cello Suites FLAC\",\"info_hash\":\"5555555555555555555555555555555555555555\",\"size\":\"500\",\"seeders\":\"9\"}]" }
+
+func names_of(hits) (out) { out = ""
+	i := 0
+	for i < len(hits) { out = out + hits[i].name + "|"
+		i = i + 1 } }
 
 func src_apibay() (s) { s = Source{name: "piratebay", kind: "json", cat: "all", url: "x", mode: "index", probe: ".[{i}].name", f_name: ".[{i}].name", f_hash: ".[{i}].info_hash", f_size: ".[{i}].size", f_seed: ".[{i}].seeders", enabled: 1} }
 
 func src_nyaa() (s) { s = Source{name: "nyaa", kind: "rss", cat: "anime", url: "x", mode: "item", probe: "<title>([^<]*)</title>", f_name: "<title>([^<]*)</title>", f_hash: "<nyaa:infoHash>([0-9a-fA-F]{40})</nyaa:infoHash>", f_size: "<nyaa:size>([^<]*)</nyaa:size>", f_seed: "<nyaa:seeders>([0-9]+)</nyaa:seeders>", enabled: 1} }
 
-func src_archive() (s) { s = Source{name: "archive", kind: "json", cat: "all", url: "x", mode: "index", probe: ".items[{i}].identifier", f_name: ".items[{i}].identifier", f_hash: "", f_size: ".items[{i}].item_size", f_seed: "", f_link: "https://archive.org/download/{v}/{v}_archive.torrent", enabled: 1} }
+func src_archive() (s) { s = Source{name: "archive", kind: "json", cat: "all", url: "x", mode: "index", probe: ".response.docs[{i}].identifier", f_name: ".response.docs[{i}].identifier", f_hash: "", f_size: ".response.docs[{i}].item_size", f_seed: "", f_link: "https://archive.org/download/{v}/{v}_archive.torrent", enabled: 1} }
 
 func main() { j := scan_json(src_apibay(), fx_apibay(), "", 10)
 	expect("json-n", str(len(j)), "2")
@@ -44,6 +60,41 @@ func main() { j := scan_json(src_apibay(), fx_apibay(), "", 10)
 	expect("filter-partial-terms", str(len(scan_json(lf, fx_apibay(), "debian ubuntu", 10))), "0")
 	expect("filter-off-passes-all", str(len(scan_json(src_apibay(), fx_apibay(), "nothinghere", 10))), "2")
 	expect("qmatch-empty", str(q_match("local", "anything", "")), "1")
+
+	// THE REGRESSION THAT MATTERS: two unrelated queries must not answer with
+	// the same rows. Every one of the three search bugs -- archive ignoring the
+	// query, apibay not being narrowed, "2" never matching "II" -- showed up in
+	// the field as two different searches returning an identical list.
+	fh := Source{name: "fh", kind: "json", cat: "all", url: "x", mode: "index", probe: ".[{i}].name", f_name: ".[{i}].name", f_hash: ".[{i}].info_hash", f_size: ".[{i}].size", f_seed: ".[{i}].seeders", filter: "local", enabled: 1}
+	nfs := names_of(scan_json(fh, fx_firehose(), "need for speed", 10))
+	bach := names_of(scan_json(fh, fx_firehose(), "bach cello", 10))
+	expect("distinct-queries-differ", str(nfs == bach), "false")
+	expect("distinct-nfs-count", str(len(scan_json(fh, fx_firehose(), "need for speed", 10))), "4")
+	expect("distinct-bach-count", str(len(scan_json(fh, fx_firehose(), "bach cello", 10))), "1")
+	// an unfiltered source would hand back all five rows for either query
+	expect("unfiltered-is-a-firehose", str(len(scan_json(src_apibay(), fx_firehose(), "bach cello", 10))), "5")
+
+	// "2" and "II" are one search
+	two := names_of(scan_json(fh, fx_firehose(), "need for speed 2", 10))
+	eye := names_of(scan_json(fh, fx_firehose(), "need for speed ii", 10))
+	expect("numeral-folds-to-roman", str(contains(two, "Need For Speed II SE PC")), "true")
+	expect("roman-folds-to-numeral", str(contains(eye, "Need For Speed II SE PC")), "true")
+	expect("numeral-folding-symmetric", str(two == eye), "true")
+	// a name with no separators at all still matches a long term
+	expect("glued-name-matches", str(contains(two, "NeedForSpeedII")), "true")
+
+	// a term must match a WHOLE token: "2" must not be satisfied by "(2003)",
+	// which is how "underground 2" answered with the 2003 game's releases
+	ug2 := names_of(scan_json(fh, fx_firehose(), "need for speed underground 2", 10))
+	expect("ug2-finds-ug2", str(contains(ug2, "Need.For.Speed.Underground.2-RELOADED")), "true")
+	expect("ug2-excludes-2003", str(contains(ug2, "(2003)")), "false")
+	ug1 := names_of(scan_json(fh, fx_firehose(), "need for speed underground", 10))
+	expect("ug-unnumbered-keeps-both", str(contains(ug1, "(2003)")), "true")
+	expect("ug-narrower-than-ug1", str(ug1 == ug2), "false")
+	// separators in the name must not hide a token
+	expect("dotted-name-tokenizes", str(q_match("local", "Need.For.Speed.Underground.2-RELOADED", "underground 2")), "1")
+	// and a substring must not pass as a token
+	expect("substring-is-not-a-token", str(q_match("local", "Need for Speed Underground (2003)", "underground 2")), "0")
 	// a link-only source yields a .torrent URL and no magnet
 	ar := scan_json(src_archive(), fx_archive(), "", 10)
 	expect("link-n", str(len(ar)), "2")

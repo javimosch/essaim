@@ -1,6 +1,6 @@
 # essaim
 
-> An agent-first BitTorrent client in one binary: JSON on stdout, progress on stderr, semantic exit codes, and an optional loopback daemon so an agent never holds a blocking call. Written in pure MFL (machin). Version: 0.6.3
+> An agent-first BitTorrent client in one binary: JSON on stdout, progress on stderr, semantic exit codes, and an optional loopback daemon so an agent never holds a blocking call. Written in pure MFL (machin). Version: 0.6.4
 
 - Site: https://javimosch.github.io/essaim/
 - Repo: https://github.com/javimosch/essaim (MIT)

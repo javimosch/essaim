@@ -33,5 +33,31 @@ func main() { expect("byte", hex_of_byte(255), "ff")
 	p := from_hex("c0a801011ae1")
 	expect("ipv4", ipv4_str(p, 0), "192.168.1.1")
 	expect("peer-port", str(rd16(p, 4)), "6881")
+	// json_unescape: machin's json_get returns the RAW characters between the
+	// quotes, so these escapes arrive as text and someone has to undo them.
+	expect("unesc-plain", json_unescape("hello world"), "hello world")
+	expect("unesc-quote", json_unescape("say \\\"hi\\\""), "say \"hi\"")
+	expect("unesc-backslash", json_unescape("a\\\\b"), "a\\b")
+	expect("unesc-newline", json_unescape("a\\nb"), "a\nb")
+	expect("unesc-tab", json_unescape("a\\tb"), "a\tb")
+	expect("unesc-solidus", json_unescape("a\\/b"), "a/b")
+	// THE MAGNET BUG: Go's encoding/json writes & as \u0026 by default, so a
+	// magnet posted by essaim-ui reached the daemon with a literal \u0026 at
+	// every separator and the record landed with no infohash.
+	expect("unesc-ampersand", json_unescape("magnet:?xt=urn:btih:abc\\u0026dn=x"), "magnet:?xt=urn:btih:abc&dn=x")
+	// THE TITLE BUG: a zero-width space in an index's name, shown as literal
+	// backslash-u-2-0-0-b in the page.
+	expect("unesc-zero-width-len", str(len(json_unescape("A\\u200bB"))), "5")
+	expect("unesc-ascii-u", json_unescape("\\u0041"), "A")
+	// two bytes for U+00E9, three for U+20AC
+	expect("unesc-2byte", str(len(json_unescape("\\u00e9"))), "2")
+	expect("unesc-3byte", str(len(json_unescape("\\u20ac"))), "3")
+	// a surrogate PAIR is one character in four bytes, not two broken ones
+	expect("unesc-surrogate-pair", str(len(json_unescape("\\ud83d\\ude00"))), "4")
+	// an escape that is not one must not lose its backslash
+	expect("unesc-unknown-kept", json_unescape("a\\qb"), "a\\qb")
+	expect("unesc-short-u-kept", json_unescape("a\\u12"), "a\\u12")
+	expect("unesc-trailing-backslash", json_unescape("ab\\"), "ab\\")
+
 	if g_fail == 0 { println("\nALL PASS") }
 	if g_fail > 0 { println("\n" + str(g_fail) + " FAILED")  exit(1) } }

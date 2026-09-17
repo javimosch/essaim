@@ -186,7 +186,9 @@ func q_match(filter, name, q) (m) { m = 1
 func jstr_at(j, path) (out) { out = ""
 	v, e := json_get(j, path)
 	if e != "" { return out }
-	if len(v) >= 2 { if charat(v, 0) == "\"" { out = substr(v, 1, len(v) - 1)  return out } }
+	// json_get returns the RAW characters between the quotes, so the escapes
+	// are still text. Undo them here, once, where every index row passes.
+	if len(v) >= 2 { if charat(v, 0) == "\"" { out = json_unescape(substr(v, 1, len(v) - 1))  return out } }
 	out = v }
 
 // RSS is split on <item> and each field pulled with its regex. A feed with no

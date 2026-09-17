@@ -36,15 +36,36 @@ func peer_worker(host, pport, t, dir, infohash, peerid, work, res, timeout, gran
 		if f.id == 4 { bf = bitfield_set(bf, rd32(f.payload, 0), t.npieces) }
 		if f.id == 1 { unchoked = 1 } }
 	res <- json(Res{kind: "ready", idx: 0 - 1, peer: who})
+	// EVERY PIECE IS FETCHED INSIDE ITS OWN ARENA.
+	//
+	// This goroutine runs for the whole download, and a goroutine's arena is
+	// only reclaimed when it RETURNS -- so without a scoped arena, every piece
+	// it ever assembled is still held when the last one arrives. Measured at
+	// ~13 MB per piece on a 4 MB-piece torrent (the piece, the buffer it was
+	// concatenated into, and the copy handed to the writer): 15 GB of RSS in
+	// 15 minutes, on both the daemon and the CLI.
+	//
+	// Only `buf` outlives the block -- it is the rolling read buffer, carrying
+	// whatever arrived after the piece -- so it is the one value that escapes.
+	// Channel sends are NOT escapes: the runtime deep-copies what crosses.
+	//
+	// Nothing returns from inside the block: a return would skip the block's
+	// cleanup and leave the arena pointer dangling (machin reports that as
+	// ARENA002), so "this peer is finished" is recorded and acted on after.
 	for 1 == 1 { idx := <-work
 		if idx < 0 { close(fd)  return }
 		if bitfield_has(bf, idx) == 0 { res <- json(Res{kind: "nohave", idx: idx, peer: who})  continue }
-		data, nbuf, got := peer_fetch_piece(fd, buf, idx, piece_size(t, idx), 1, grant, limited)
-		buf = nbuf
-		if got == 0 { close(fd)  res <- json(Res{kind: "gone", idx: idx, peer: who, err: "dropped mid-piece"})  return }
-		if piece_ok(t, idx, data) == 0 { res <- json(Res{kind: "bad", idx: idx, peer: who, err: "hash mismatch"})  continue }
-		if store_write_piece(t, dir, idx, data) < 0 { res <- json(Res{kind: "bad", idx: idx, peer: who, err: "write failed"})  continue }
-		res <- json(Res{kind: "piece", idx: idx, ok: 1, peer: who}) } }
+		dead := 0
+		arena { data, nbuf, got := peer_fetch_piece(fd, buf, idx, piece_size(t, idx), 1, grant, limited)
+			buf = escape(nbuf)
+			if got == 0 { res <- json(Res{kind: "gone", idx: idx, peer: who, err: "dropped mid-piece"})
+				dead = 1 }
+			if got == 1 { verified := piece_ok(t, idx, data)
+				if verified == 0 { res <- json(Res{kind: "bad", idx: idx, peer: who, err: "hash mismatch"}) }
+				if verified == 1 { wrote := store_write_piece(t, dir, idx, data)
+					if wrote < 0 { res <- json(Res{kind: "bad", idx: idx, peer: who, err: "write failed"}) }
+					if wrote >= 0 { res <- json(Res{kind: "piece", idx: idx, ok: 1, peer: who}) } } } }
+		if dead == 1 { close(fd)  return } } }
 
 // bitfield_set records a `have` announcement arriving after the bitfield.
 func bitfield_set(bf, idx, npieces) (out) { out = bf
@@ -75,7 +96,7 @@ func bitfield_set(bf, idx, npieces) (out) { out = bf
 // cap is global rather than per connection. It exists even when uncapped,
 // because a struct field cannot be conditionally absent -- dlimited decides
 // whether anybody waits on it.
-type Job struct { id string  dir string  t Torrent  work chan int  res chan string  have []int  live int  nworkers int  nohaves int  s Stats  started int  active int  dgrant chan int  dlimited int  down_limit int }
+type Job struct { id string  dir string  t Torrent  work chan int  res chan string  have []int  live int  nworkers int  nohaves int  s Stats  started int  active int  dgrant chan int  dlimited int  down_limit int  cursor int  outstanding int  window int }
 
 // dpacer issues one grant per block at the configured rate, and deliberately
 // has NO acknowledgement channel.
@@ -101,46 +122,98 @@ func job_start(id, t, dir, peers, peerid, timeout, down_limit_kbs) (j) { j = Job
 		if interval < 1 { interval = 1 }
 		go dpacer(j.dgrant, interval) }
 	i = 0
-	for i < t.npieces { if j.have[i] == 0 { j.work <- i }  i = i + 1 }
+	// Queue a WINDOW, not every missing piece.
+	//
+	// This used to push all 2923 indices of a big torrent into the work
+	// channel at once. machin's channels are unbounded, so that queue simply
+	// sat there -- and the daemon's cost per tick was measured to track its
+	// LENGTH: ~10 MB per tick with it full, 179 kB once drained, on the same
+	// torrent with everything else unchanged. 15 GB of RSS in 15 minutes.
+	//
+	// A window deep enough to keep every worker fed is all the queue is for.
+	j.window = len(peers) * 4 + 8
+	j.cursor = 0
+	j.outstanding = 0
 	i = 0
 	for i < len(peers) { go peer_worker(peers[i].ip, peers[i].port, t, dir, t.infohash, peerid, j.work, j.res, timeout, j.dgrant, j.dlimited)
 		j.live = j.live + 1
 		j.nworkers = j.nworkers + 1
 		i = i + 1 }
-	if j.live == 0 { j.active = 0 } }
+	if j.live == 0 { j.active = 0 }
+	if j.active == 1 { js := []Job{j}
+		fill_work_at(js, 0)
+		j = js[0] } }
 
-// job_pump drains everything waiting and returns at once. `progress` echoes each
-// verified piece to stderr for the foreground path.
-func job_pump(j, progress) (out) { out = j
-	if out.active == 0 { return out }
+// fill_work_at tops the queue back up to the window, walking the pieces still
+// missing. When a pass ends with pieces outstanding nowhere, it starts again --
+// a piece no peer had a minute ago may be served by the next peer to connect.
+func fill_work_at(jobs, i) { guard := 0
+	for jobs[i].outstanding < jobs[i].window { guard = guard + 1
+		if guard > jobs[i].t.npieces + 1 { return }
+		if jobs[i].cursor >= jobs[i].t.npieces { if jobs[i].outstanding > 0 { return }
+			jobs[i].cursor = 0 }
+		c := jobs[i].cursor
+		jobs[i].cursor = c + 1
+		if jobs[i].have[c] == 0 { jobs[i].work <- c
+			jobs[i].outstanding = jobs[i].outstanding + 1 } } }
+
+// job_pump_at drains a job IN PLACE, by index into the caller's slice.
+//
+// It does not take or return a Job, and that is the whole point. A Job holds
+// the work channel, and machin channels are unbounded: job_start queues every
+// missing piece index into it, so early on that queue holds thousands of
+// entries. Copying a Job copies that queue -- and the daemon ran
+// `jobs[i] = job_pump(jobs[i], 0)` five times a second, paying two such copies
+// per tick into the main loop's arena, WHICH IS NEVER RECLAIMED because that
+// goroutine never returns.
+//
+// Measured on a 2923-piece torrent: ~10 MB per tick with the queue full, 179 kB
+// per tick once it had drained -- the cost tracked the queue, not the pieces.
+// In the field that was 15 GB of RSS in 15 minutes. The CLI never showed it,
+// because engine_download pumps a LOCAL variable and a local is not copied into
+// an arena; only the slice element was.
+//
+// Slices are reference-like here (a callee mutates the caller's elements), so
+// the fix is to mutate through the slice and never form a Job value at all.
+// `progress` echoes each verified piece to stderr for the foreground path.
+func job_pump_at(jobs, i, progress) { if jobs[i].active == 0 { return }
 	drained := 1
 	for drained == 1 { drained = 0
-		select { case m := <-out.res: drained = 1
+		// Yield when every live peer has refused the queue head: a "nohave" is
+		// requeued at once, so the peer that just refused it takes it again.
+		// Leaving the messages queued for the next tick is what makes the
+		// workers block on an empty queue and the ping-pong cool.
+		if job_starved(jobs[i]) == 1 { jobs[i].nohaves = 0
+			return }
+		select { case m := <-jobs[i].res: drained = 1
 			r := parse(m, Res{})
-			if r.kind == "ready" { out.s.peers_ok = out.s.peers_ok + 1 }
-			if r.kind == "gone" { out.live = out.live - 1
-				out.s.peers_dead = out.s.peers_dead + 1
+			if r.kind == "ready" { jobs[i].s.peers_ok = jobs[i].s.peers_ok + 1 }
+			if r.kind == "gone" { jobs[i].live = jobs[i].live - 1
+				jobs[i].s.peers_dead = jobs[i].s.peers_dead + 1
 				// a peer that died holding a piece hands it back, so the work is
 				// not lost with the connection
-				if r.idx >= 0 { out.work <- r.idx } }
-			if r.kind == "nohave" { out.nohaves = out.nohaves + 1
-				out.work <- r.idx }
-			if r.kind == "bad" { out.work <- r.idx }
-			if r.kind == "piece" { if out.have[r.idx] == 0 { out.have[r.idx] = 1
-					out.s.done = out.s.done + 1
-					out.s.bytes = out.s.bytes + piece_size(out.t, r.idx)
-					if progress == 1 { eprint("piece " + str(out.s.done) + "/" + str(out.t.npieces) + " from " + r.peer) } } }
+				if r.idx >= 0 { jobs[i].work <- r.idx } }
+			if r.kind == "nohave" { jobs[i].nohaves = jobs[i].nohaves + 1
+				jobs[i].work <- r.idx }
+			if r.kind == "bad" { jobs[i].work <- r.idx }
+			if r.kind == "piece" { jobs[i].outstanding = jobs[i].outstanding - 1
+				if jobs[i].have[r.idx] == 0 { jobs[i].have[r.idx] = 1
+					jobs[i].s.done = jobs[i].s.done + 1
+					jobs[i].s.bytes = jobs[i].s.bytes + piece_size(jobs[i].t, r.idx)
+					if progress == 1 { eprint("piece " + str(jobs[i].s.done) + "/" + str(jobs[i].t.npieces) + " from " + r.peer) } } }
 		default: } }
-	if out.s.done >= out.t.npieces { out.s.complete = 1  out = job_stop(out) }
-	if out.live <= 0 { out = job_stop(out) }
-	out.s.elapsed = now_ms() - out.started }
+	if jobs[i].active == 1 { fill_work_at(jobs, i) }
+	if jobs[i].s.done >= jobs[i].t.npieces { jobs[i].s.complete = 1
+		job_stop_at(jobs, i) }
+	if jobs[i].live <= 0 { job_stop_at(jobs, i) }
+	jobs[i].s.elapsed = now_ms() - jobs[i].started }
 
-// job_stop retires the workers so none is left parked on an empty queue.
-func job_stop(j) (out) { out = j
-	if out.active == 0 { return out }
-	i := 0
-	for i < out.nworkers { out.work <- 0 - 1  i = i + 1 }
-	out.active = 0 }
+// job_stop_at retires the workers in place, for the same reason.
+func job_stop_at(jobs, i) { if jobs[i].active == 0 { return }
+	k := 0
+	for k < jobs[i].nworkers { jobs[i].work <- 0 - 1
+		k = k + 1 }
+	jobs[i].active = 0 }
 
 // job_starved reports that every live peer refused the queue head, which means
 // nobody has it yet and the caller should yield rather than spin.
@@ -149,11 +222,15 @@ func job_starved(j) (yes) { yes = 0
 
 // engine_download is the blocking form: start, then pump until done or the
 // deadline. Same logic, one implementation.
-func engine_download(t, dir, peers, peerid, timeout, deadline_ms, down_limit_kbs, progress) (s) { j := job_start("cli", t, dir, peers, peerid, timeout, down_limit_kbs)
-	for j.active == 1 { if now_ms() - j.started > deadline_ms { j = job_stop(j)  break }
-		j = job_pump(j, progress)
-		if job_starved(j) == 1 { j.nohaves = 0  sleep(200) }
-		if j.active == 1 { sleep(20) } }
-	s = j.s
-	s.elapsed = now_ms() - j.started
+func engine_download(t, dir, peers, peerid, timeout, deadline_ms, down_limit_kbs, progress) (s) { jobs := []Job{job_start("cli", t, dir, peers, peerid, timeout, down_limit_kbs)}
+	// A one-element slice, so the blocking path and the daemon share ONE pump.
+	// It also costs nothing: pumping in place is what stops the Job -- and the
+	// queue inside it -- being copied on every iteration.
+	for jobs[0].active == 1 { if now_ms() - jobs[0].started > deadline_ms { job_stop_at(jobs, 0)
+			break }
+		job_pump_at(jobs, 0, progress)
+		if job_starved(jobs[0]) == 1 { jobs[0].nohaves = 0  sleep(200) }
+		if jobs[0].active == 1 { sleep(20) } }
+	s = jobs[0].s
+	s.elapsed = now_ms() - jobs[0].started
 	if s.done >= t.npieces { s.complete = 1 } }

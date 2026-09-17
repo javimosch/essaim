@@ -369,7 +369,7 @@ func daemon_serve(host, port, token, tick, peerport, timeout, progress) (err) { 
 									if recs[k].state == "seeding" { recs[k].state = "complete" } } }
 							registry_save(recs)
 							respond(fd, 200, "{\"ok\":true,\"torrent\":" + rec_json(recs[k]) + "}") }
-						if method == "DELETE" { jobs[k] = job_stop(jobs[k])
+						if method == "DELETE" { job_stop_at(jobs, k)
 							seeders[k] = seed_stop(seeders[k])
 							recs = rec_remove(recs, k)
 							jobs = job_remove(jobs, k)
@@ -402,7 +402,7 @@ func daemon_serve(host, port, token, tick, peerport, timeout, progress) (err) { 
 			default: } }
 		// pump every job and seeder
 		i = 0
-		for i < len(jobs) { if jobs[i].active == 1 { jobs[i] = job_pump(jobs[i], 0)
+		for i < len(jobs) { if jobs[i].active == 1 { job_pump_at(jobs, i, 0)
 				recs[i].done = jobs[i].s.done
 				recs[i].bytes = jobs[i].s.bytes
 				recs[i].peers = jobs[i].s.peers_ok

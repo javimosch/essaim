@@ -1,6 +1,7 @@
 # essaim
 
-An agent-first BitTorrent client. One 144 kB binary, JSON on stdout, no daemon.
+An agent-first BitTorrent client. One 242 kB binary, JSON on stdout, no daemon
+required.
 
 Written in [MFL](https://github.com/javimosch/machin) — bencode, the peer wire
 protocol, trackers, BEP 9 metadata exchange and SHA-1 verification are all pure
@@ -56,7 +57,7 @@ always equals `error.code` in the body.
 
 essaim is agent-first and that is the point — but a person looking at a
 download queue would usually rather see it than read JSON.
-[**essaim-ui**](https://github.com/javimosch/essaim-ui) is one static binary
+[**essaim-ui**](https://github.com/javimosch/essaim-ui) is a separate binary
 that drives this daemon's HTTP API from a browser: add by magnet, per-torrent
 upload and download caps, a stop-at ratio, the full path on disk, and
 remove-with-data.
@@ -88,15 +89,23 @@ and exist as worked examples of the two supported response shapes — flip
 Enable a disabled row for one run without rebuilding:
 
 ```sh
-essaim search "hitman" --cat games --source piratebay-games
+essaim sources                                  # the row names, and which are live
+essaim search "…" --cat games --source <name>   # one run, one row
 ESSAIM_SOURCES=all essaim search "…"
 ```
 
 Two response shapes cover every index worth querying: a JSON API addressed by
 path templates (`{i}` = row index) and an RSS feed split on `<item>` and read
 with regexes. A source that errors is skipped with a note on stderr — one dead
-index must not sink a search. Rows marked `filter: "local"` return a firehose
-regardless of the query, so essaim narrows them itself.
+index must not sink a search. Rows marked `filter: "local"` are narrowed by essaim
+itself, which every index row now is: some ignore the query outright, and the
+ones that rank by relevance still return rows that miss a term.
+
+**Every term of a query must match**, as a whole word rather than a substring —
+so `underground 2` does not return `Underground (2003)`, whose only `2` is inside
+`2003`. Roman numerals fold to digits and back (`need for speed 2` finds the `II`
+releases), and separators are folded, so a dotted release name matches a spaced
+query.
 
 `essaim sources` lists what is compiled in and which rows are live.
 
@@ -299,7 +308,7 @@ OpenSSL archives for musl.
 
 ```sh
 ./build.sh      # machin encode src/*.src > essaim.mfl && machin build essaim.mfl
-./tests/run.sh  # 325 assertions across 11 module suites + a CLI suite
+./tests/run.sh  # 345 assertions across 11 module suites + a CLI suite
 ```
 
 Tests need no network: the tracker suite stands up a fake BEP 15 tracker, the

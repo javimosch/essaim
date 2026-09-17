@@ -117,7 +117,14 @@ func seed_peer(fd, t, dir, peerid, bfhex, grant, ack, limited, stats, maxblock) 
 // retry_at/retry_ms back off a FAILED seed_start. Without them a failure left
 // active==0 and srv==-1, which is exactly the pump's restart condition, so the
 // daemon retried every tick forever and its main-loop arena grew ~1.8 MB/s.
-type Seeder struct { srv int  stats chan string  grant chan int  ack chan int  limited int  up int  peers int  active int  port int  uplimit int  stop chan int  retry_at int  retry_ms int }
+// up_base carries the upload total this torrent had BEFORE this seeder started.
+// `up` counts only what this process has sent, so without a base every restart
+// began the ratio at zero -- the cap bounded a session rather than a lifetime.
+//
+// announce_at is when to tell the trackers again. A tracker forgets a peer that
+// stops announcing (30 minutes is the usual interval), so a seeder that
+// announced once quietly disappears from the swarm.
+type Seeder struct { srv int  stats chan string  grant chan int  ack chan int  limited int  up int  peers int  active int  port int  uplimit int  stop chan int  retry_at int  retry_ms int  up_base int  announce_at int  saved_at int }
 
 func seed_start(t, dir, port, uplimit_kbs, peerid) (sd, err) { sd = Seeder{srv: 0 - 1, stats: make(chan string), grant: make(chan int), ack: make(chan int), limited: 0, up: 0, peers: 0, active: 0, port: port, uplimit: uplimit_kbs, stop: make(chan int), retry_at: 0, retry_ms: 0}
 	err = ""

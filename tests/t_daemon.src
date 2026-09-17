@@ -60,6 +60,27 @@ func main() { home := "/tmp/essaim-daemon-test"
 	expect("unit-exec", str(contains(u, "ExecStart=/opt/essaim serve")), "true")
 	expect("unit-restart", str(contains(u, "Restart=always")), "true")
 	expect("unit-install", str(contains(u, "WantedBy=default.target")), "true")
+	// The registry must carry the upload total. It did not, so every daemon
+	// restart began the ratio at zero and the cap bounded a session rather
+	// than a lifetime: restart often enough and you seed forever.
+	saved := []Rec{Rec{id: "aaaaaaaaaaaa", source: "magnet:?xt=urn:btih:abc", dir: "/tmp/x", seed: 1,
+		up_limit: 0, down_limit: 0, ratio_pct: 30, uploaded: 445500000, infohash: "abc", name: "thing"}}
+	registry_save(saved)
+	back := registry_load()
+    expect("registry-one-row", str(len(back)), "1")
+	if len(back) > 0 { expect("registry-keeps-uploaded", str(back[0].uploaded), "445500000")
+		expect("registry-keeps-ratio", str(back[0].ratio_pct), "30")
+		expect("registry-keeps-seed", str(back[0].seed), "1")
+		// and that total is what the cap is measured against
+		back[0].bytes = 1461100000
+		expect("ratio-uses-persisted-total", str(ratio_done(back[0])), "1")
+		back[0].ratio_pct = 50
+		expect("ratio-not-reached-at-50pct", str(ratio_done(back[0])), "0") }
+	// leave the registry empty: the live daemon below starts from this same
+	// home, and would otherwise load this row and report it as its own
+	registry_save([]Rec{})
+	expect("registry-cleared", str(len(registry_load())), "0")
+
 	// a live daemon: health, add, list, delete, shutdown
 	done := make(chan string)
 	go srv("127.0.0.1", 18790, "tok", done)
